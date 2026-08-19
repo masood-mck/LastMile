@@ -53,13 +53,23 @@ finally {
 }
 
 Write-Host "Ensuring Linux Premium plan exists..." -ForegroundColor Yellow
-$planExists = Run-AzCli "az appservice plan show -g $ResourceGroup -n $AppServicePlan --query name -o tsv 2>$null"
+try {
+    $planExists = Run-AzCli "az appservice plan show -g $ResourceGroup -n $AppServicePlan --query name -o tsv"
+}
+catch {
+    $planExists = ""
+}
 if (-not $planExists) {
     Run-AzCli "az appservice plan create -g $ResourceGroup -n $AppServicePlan --is-linux --sku P1v3 --location $Location" | Out-Null
 }
 
 Write-Host "Ensuring web app exists..." -ForegroundColor Yellow
-$webAppExists = Run-AzCli "az webapp show -g $ResourceGroup -n $WebAppName --query name -o tsv 2>$null"
+try {
+    $webAppExists = Run-AzCli "az webapp show -g $ResourceGroup -n $WebAppName --query name -o tsv"
+}
+catch {
+    $webAppExists = ""
+}
 if (-not $webAppExists) {
     try {
         Run-AzCli "az webapp create -g $ResourceGroup -p $AppServicePlan -n $WebAppName --deployment-container-image-name $imageRef --https-only true" | Out-Null
