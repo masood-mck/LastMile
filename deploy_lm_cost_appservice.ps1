@@ -41,7 +41,7 @@ if (-not $acrLoginServer) {
     throw "Unable to resolve ACR login server for $AcrName"
 }
 
-$imageRef = "$acrLoginServer/$ImageName:$ImageTag"
+$imageRef = "$acrLoginServer/$($ImageName):$($ImageTag)"
 
 Write-Host "Building image in ACR..." -ForegroundColor Yellow
 Push-Location $appPath
