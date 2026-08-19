@@ -1,0 +1,18 @@
+command:
+  - streamlit
+  - run
+  - lm_cost_app.py
+  - --server.port
+  - $DATABRICKS_APP_PORT
+  - --server.address
+  - 0.0.0.0
+  - --server.headless
+  - "true"
+
+# env:
+#   # Point the dashboard at a Unity Catalog table (preferred)...
+#   - name: NORM_DATA_PATH
+#     value: "/Volumes/mycatalog/myschema/myvol/LM_CS_slim.csv"
+  # ...or comment the table above and use a Volume/DBFS CSV path instead:
+  # - name: NORM_DATA_PATH
+  #   value: "/Volumes/catalog/schema/vol/LM_CS_slim.csv"
