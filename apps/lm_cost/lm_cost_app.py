@@ -987,20 +987,20 @@ if market_options:
 # Business charts
 # --------------------------------------------------------------------------- #
 st.subheader("2. Business views")
-tab0, tab00, tab01, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8 = st.tabs(
     [
         "Method Flow",
         "Methodology",
         "Signal summary",
+        "Cleansheet triangulation",
+        "Signal Buckets",
         "Actual vs expected",
         "Top overpay",
         "Cost band",
-        "Cleansheet triangulation",
         "Cost Comparison",
         "Triangulation V1",
         "Triangulation V2",
         "Triangulation V3",
-        "Signal Buckets",
     ]
 )
 
@@ -1049,7 +1049,7 @@ with tab0:
             """
             **Expected CPS**
 
-            Qualtile Gradient Boosting Model
+            Quantile Gradient Boosting Model
 
             P10 / P50 / P90
             """

@@ -136,11 +136,39 @@ az acr build --registry ftlhubacr --image lm-cost:latest .
 
 If policies block CLI create, use Portal wizard like FTL and set at create-time:
 
+- Name = `lm-cost`
+- Publish = `Container`
+- Operating System = `Linux`
+- Region = `East US`
+- App Service Plan = `lm-cost-plan`
+- Pricing tier = `P1v3 / Premium V3`
 - HTTPS only = On
 - Public network access = Disabled
 - Container image = `ftlhubacr.azurecr.io/lm-cost:latest`
 - Container port = `8501`
 - Private endpoint = Enabled
+
+Container tab settings used for successful creation:
+
+- Registry source = `Azure Container Registry`
+- Registry = `ftlhubacr`
+- Image = `lm-cost`
+- Tag = `latest`
+- Authentication = `Admin credentials`
+
+Why admin credentials were used:
+
+- In this environment, managed identity was not able to enumerate the image during initial Portal creation.
+- Admin credentials are acceptable for bootstrapping creation.
+- After creation, you can move to managed identity + `AcrPull` if desired.
+
+Networking tab settings:
+
+- Enable public access = `Off`
+- Inbound private endpoint = `On`
+- VNet = `vnet-eastus-mt-sco-prod`
+- Subnet = `common`
+- DNS = `Azure Private DNS Zone`
 
 ### 4.5 Set app settings
 
@@ -163,6 +191,77 @@ az webapp log tail -g rg-vnet-eastus-mt-sco-prod-gen2 -n lm-cost
 ```
 
 Validate app load and interaction after restart.
+
+Successful deployment output example:
+
+```text
+Image: ftlhubacr.azurecr.io/lm-cost:latest
+App: https://lm-cost-akhfhje3c5d6cmez.eastus-01.azurewebsites.net
+```
+
+Use the Azure Portal Overview page default hostname, not an assumed hostname.
+
+### 4.7 Run from Azure Cloud Shell
+
+Because Cloud Shell sessions are ephemeral, reclone or re-upload the repo when a session resets.
+
+1. Open Azure Portal Cloud Shell.
+2. Set the subscription:
+
+```bash
+az account set --subscription 912590af-f1f7-4844-9c9b-75a04f4fd0b7
+```
+
+3. Clone the repo:
+
+```bash
+git clone https://github.com/masood-mck/LastMile.git
+cd ~/LastMile
+```
+
+4. Run the deployment script:
+
+```bash
+pwsh ./deploy_lm_cost_appservice.ps1 \
+  -SubscriptionId 912590af-f1f7-4844-9c9b-75a04f4fd0b7 \
+  -ResourceGroup rg-vnet-eastus-mt-sco-prod-gen2 \
+  -AcrName ftlhubacr \
+  -AppServicePlan lm-cost-plan \
+  -WebAppName lm-cost \
+  -ImageName lm-cost
+```
+
+Optional runtime data source:
+
+```bash
+pwsh ./deploy_lm_cost_appservice.ps1 -NormDataTable yourcatalog.yourschema.yourtable
+```
+
+or
+
+```bash
+pwsh ./deploy_lm_cost_appservice.ps1 -NormDataPath /Volumes/catalog/schema/volume/LM_CS_slim.csv
+```
+
+If `git clone` is not available because the repo is private, upload a zip to Cloud Shell and unzip it before running the script.
+
+### 4.8 Post-deployment checks
+
+1. Azure Portal -> App Service -> `lm-cost` -> Overview:
+   - confirm default hostname exists
+2. Azure Portal -> App Service -> Log stream:
+   - confirm Streamlit starts successfully
+3. Azure Portal -> App Service -> Configuration:
+   - verify `NORM_DATA_TABLE` or `NORM_DATA_PATH` if needed
+4. Access the app from corporate network / VPN
+5. If DNS does not resolve, request private DNS forwarding for `privatelink.azurewebsites.net`
+
+### 4.9 Known deployment constraints
+
+- CLI creation of the web app can fail with policy `Core.PublicNet` because `publicNetworkAccess` must be disabled at creation time.
+- The correct workaround is one-time Portal creation with public access off.
+- Cloud Shell file system is ephemeral; cloned repos are lost when the session resets.
+- Use `ls -la` in Cloud Shell, not `la`.
 
 ---
 
