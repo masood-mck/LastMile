@@ -201,6 +201,10 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
+    # Standardize stop-location identifier so downstream datasets are consistent.
+    if "CNSLDTN_ID" not in df.columns and "TRACKING_ID" in df.columns:
+        df["CNSLDTN_ID"] = df["TRACKING_ID"]
+
     xdock_col = _first_present(df, XDOCK_CANDIDATES)
     year_col = _first_present(df, YEAR_CANDIDATES)
     month_col = _first_present(df, MONTH_CANDIDATES)
@@ -483,11 +487,28 @@ def build_scorecard(
     market["cleansheet_cons_gap_pct"] = safe_div(market["actual_median_cps"], market[cons_col]) - 1 if cons_col in market.columns else np.nan
     market["cleansheet_aggr_gap_pct"] = safe_div(market["actual_median_cps"], market[aggr_col]) - 1 if aggr_col in market.columns else np.nan
 
+    # Cleansheet sensitivity mirrors normalized-cost sensitivity: compare benchmark cost to actual CPS.
+    if cons_col in market.columns and aggr_col in market.columns:
+        has_both_cleansheet = market[cons_col].notna() & market[aggr_col].notna()
+        market["cleansheet_mid_cost"] = np.where(
+            has_both_cleansheet,
+            (market[cons_col] + market[aggr_col]) / 2,
+            np.nan,
+        )
+        market["cleansheet_range_spread_pct"] = np.abs(safe_div(market[aggr_col], market[cons_col]) - 1)
+    else:
+        market["cleansheet_mid_cost"] = np.nan
+        market["cleansheet_range_spread_pct"] = np.nan
+
+    market["cleansheet_sensitivity_pct"] = safe_div(market["cleansheet_mid_cost"], market["actual_median_cps"]) - 1
+    market["cleansheet_sensitivity_abs_pct"] = np.abs(market["cleansheet_sensitivity_pct"])
+    market["combined_sensitivity_abs_pct"] = market[["norm_sensitivity_abs_pct", "cleansheet_sensitivity_abs_pct"]].mean(axis=1, skipna=True)
+
     market["confidence_score"] = 0
     market.loc[market["paid_records"] >= min_group_n, "confidence_score"] += 1
     market.loc[market["paid_records"] >= min_group_n * 3, "confidence_score"] += 1
     market.loc[market["zero_rate"] <= 0.35, "confidence_score"] += 1
-    market.loc[market["norm_sensitivity_abs_pct"].fillna(0) <= 0.40, "confidence_score"] += 1
+    market.loc[market["combined_sensitivity_abs_pct"].fillna(0) <= 0.40, "confidence_score"] += 1
     market["confidence"] = np.select(
         [market["confidence_score"] >= 4, market["confidence_score"] == 3, market["confidence_score"] == 2],
         ["High", "Medium", "Low"],
@@ -516,13 +537,13 @@ def build_scorecard(
             market["classification"].str.contains("overpay", case=False, na=False) & market["cleansheet_overpay_support"],
             market["classification"].str.contains("underpay", case=False, na=False) & market["cleansheet_underpay_support"],
             market["classification"].eq("Not enough evidence"),
-            market["norm_sensitivity_abs_pct"].fillna(0) > 0.40,
+            market["combined_sensitivity_abs_pct"].fillna(0) > 0.40,
         ],
         [
             "Model and cleansheet both point high",
             "Model and cleansheet both point low",
             "Low volume, high zero rate, or weak basis",
-            "Sensitive to multiplier assumptions",
+            "Sensitive to normalization and cleansheet assumptions",
         ],
         default="Model-based residual signal",
     )
@@ -553,6 +574,8 @@ def build_scorecard(
     market["Gap vs Conservative Cleansheet %"] = market["cleansheet_cons_gap_pct"]
     market["Gap vs Aggressive Cleansheet %"] = market["cleansheet_aggr_gap_pct"]
     market["Normalization Sensitivity"] = market["norm_sensitivity_abs_pct"]
+    market["Cleansheet Sensitivity"] = market["cleansheet_sensitivity_abs_pct"]
+    market["Combined Sensitivity"] = market["combined_sensitivity_abs_pct"]
 
     display_cols = existing_cols(
         market,
@@ -574,6 +597,8 @@ def build_scorecard(
             "CPS Gap vs Expected %",
             "Normalized Cost",
             "Normalization Sensitivity",
+            "Cleansheet Sensitivity",
+            "Combined Sensitivity",
             "Cleansheet Conservative",
             "Cleansheet Aggressive",
             "Gap vs Conservative Cleansheet %",
@@ -1248,6 +1273,33 @@ They help determine whether the overpay or underpay signal is credible and worth
 Expected CPS drives the classification.
 
 Normalized Cost and Cleansheet provide supporting evidence to strengthen or challenge the recommendation.
+
+---
+
+### 6. Confidence Logic
+
+Confidence is a rule-based score from 0 to 4 points. One point is added for each condition met:
+
+1. Paid records are at least the minimum threshold (`paid_records >= min_group_n`)
+2. Paid records are at least 3x the minimum threshold (`paid_records >= 3 * min_group_n`)
+3. Zero-cost rate is acceptable (`zero_rate <= 35%`)
+4. Combined sensitivity is stable (`combined_sensitivity_abs_pct <= 40%`)
+
+Combined sensitivity is the average of:
+
+- Normalization sensitivity: `abs((Normalized Cost / Actual CPS) - 1)`
+- Cleansheet sensitivity: `abs((Cleansheet Midpoint / Actual CPS) - 1)`
+
+Where Cleansheet Midpoint is the midpoint between conservative and aggressive cleansheet CPS when both are available.
+
+Confidence labels:
+
+- High: score >= 4
+- Medium: score = 3
+- Low: score = 2
+- Very Low: score <= 1
+
+Very Low confidence groups are treated as Not enough evidence in final classification.
     """)
 
     st.subheader("Current Model Statistics")
@@ -2298,7 +2350,14 @@ with st.expander("Methodology and model diagnostics"):
         - Use positive paid rows to calculate market-level actual median CPS.
         - Fit a quantile gradient boosting model to estimate expected CPS bands.
         - P50 is the expected median CPS. P10/P90 define the low/high expected range.
-        - Classification is based on actual CPS versus expected CPS, with confidence checks for volume, zero-cost rate, and normalization sensitivity.
+                - Classification is based on actual CPS versus expected CPS, with confidence checks for volume, zero-cost rate, and combined sensitivity.
+                - Combined sensitivity = average of normalization sensitivity and cleansheet sensitivity.
+                - Confidence points (0-4):
+                    - +1 if paid records >= minimum threshold
+                    - +1 if paid records >= 3x minimum threshold
+                    - +1 if zero-cost rate <= 35%
+                    - +1 if combined sensitivity <= 40%
+                - Confidence labels: High (4), Medium (3), Low (2), Very Low (0-1).
 
         **Why this is more defensible than normalized cost alone**
         - Normalized cost is included as a supporting metric.
