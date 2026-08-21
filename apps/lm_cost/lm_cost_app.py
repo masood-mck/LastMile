@@ -245,7 +245,7 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     ]
     df = numeric_coerce(df, numeric_cols)
 
-    for c in existing_cols(df, ["XDOCK", "FILL_DC_CD", "CARRIER_SCAC_CD", "ASN_TYPE_CD", "DELIVERY_TYPE"]):
+    for c in existing_cols(df, ["XDOCK", "FILL_DC_CD", "CARRIER_SCAC_CD", "ASN_TYPE_CD", "DELIVERY_TYPE", "CUST_BUS_TYP_DSCR"]):
         df[c] = df[c].astype("string").fillna("Unknown")
 
     if "FILL_DC_CD" in df.columns:
@@ -896,6 +896,12 @@ with st.sidebar:
     if sel_dcs:
         filtered = filtered[filtered["FILL_DC_CD"].astype(str).isin(sel_dcs)].copy()
 
+    if "CUST_BUS_TYP_DSCR" in filtered.columns:
+        cust_type_options = sorted(filtered["CUST_BUS_TYP_DSCR"].dropna().astype(str).unique())
+        sel_cust_types = st.multiselect("Customer type filter", cust_type_options, default=cust_type_options)
+        if sel_cust_types:
+            filtered = filtered[filtered["CUST_BUS_TYP_DSCR"].astype(str).isin(sel_cust_types)].copy()
+
     grain = st.radio(
         "Scoring grain",
         ["Market only", "Market + carrier"],
@@ -1012,7 +1018,7 @@ if market_options:
 # Business charts
 # --------------------------------------------------------------------------- #
 st.subheader("2. Business views")
-tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8 = st.tabs(
+tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab10 = st.tabs(
     [
         "Method Flow",
         "Methodology",
@@ -1026,6 +1032,7 @@ tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8 = st.ta
         "Triangulation V1",
         "Triangulation V2",
         "Triangulation V3",
+        "Customer Layer",
     ]
 )
 
@@ -2337,6 +2344,120 @@ Interpretation:
                     file_name=f"signal_bucket_{selected_bucket.replace(' ', '_').replace('/', '_').replace('|', '_')}.csv",
                     mime="text/csv",
                 )
+
+
+with tab10:
+
+    st.subheader("Customer type layer")
+
+    if "CUST_BUS_TYP_DSCR" not in filtered.columns:
+        st.info("Customer type column (CUST_BUS_TYP_DSCR) is not present in this dataset.")
+    else:
+        cust_df = filtered.copy()
+        cust_df["CUST_BUS_TYP_DSCR"] = cust_df["CUST_BUS_TYP_DSCR"].astype("string").fillna("Unknown")
+
+        paid_rows = cust_df[cust_df[TARGET].notna() & (cust_df[TARGET] > 0)].copy()
+        if paid_rows.empty:
+            st.info("No paid rows available for customer-type analysis under current filters.")
+        else:
+            if "CARRIER_SCAC_CD" in paid_rows.columns:
+                paid_rows["Carrier"] = paid_rows["CARRIER_SCAC_CD"].astype(str)
+            else:
+                paid_rows["Carrier"] = "All carriers"
+
+            type_summary = (
+                paid_rows.groupby("CUST_BUS_TYP_DSCR", dropna=False)
+                .agg(
+                    Records=(TARGET, "size"),
+                    Median_CPS=(TARGET, "median"),
+                    Mean_CPS=(TARGET, "mean"),
+                    Total_Cost=(TARGET, "sum"),
+                )
+                .reset_index()
+                .sort_values("Records", ascending=False)
+            )
+
+            total_records = max(int(type_summary["Records"].sum()), 1)
+            total_cost = type_summary["Total_Cost"].sum()
+            type_summary["Records_%"] = type_summary["Records"] / total_records
+            type_summary["Cost_%"] = np.where(total_cost > 0, type_summary["Total_Cost"] / total_cost, np.nan)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Customer types", f"{type_summary['CUST_BUS_TYP_DSCR'].nunique():,}")
+            c2.metric("Paid records", f"{total_records:,}")
+            c3.metric("Total paid cost", money(total_cost))
+
+            fig_mix = px.bar(
+                type_summary,
+                x="CUST_BUS_TYP_DSCR",
+                y="Records",
+                color="Median_CPS",
+                color_continuous_scale="Blues",
+                title="Customer type mix by paid records (color = median CPS)",
+            )
+            fig_mix.update_layout(height=520, xaxis_title="Customer Type", yaxis_title="Paid Records")
+            st.plotly_chart(fig_mix, use_container_width=True)
+
+            by_market_type = (
+                paid_rows.groupby(["XDOCK", "CUST_BUS_TYP_DSCR"], dropna=False)
+                .agg(
+                    Records=(TARGET, "size"),
+                    Actual_CPS=(TARGET, "median"),
+                )
+                .reset_index()
+            )
+
+            expected_by_type = (
+                by_market_type.groupby("CUST_BUS_TYP_DSCR", dropna=False)["Actual_CPS"]
+                .median()
+                .rename("Expected_CPS_By_Type")
+                .reset_index()
+            )
+
+            by_market_type = by_market_type.merge(expected_by_type, on="CUST_BUS_TYP_DSCR", how="left")
+            by_market_type["Gap_vs_Type_Expected_%"] = safe_div(
+                by_market_type["Actual_CPS"], by_market_type["Expected_CPS_By_Type"]
+            ) - 1
+
+            top_types = (
+                by_market_type.groupby("CUST_BUS_TYP_DSCR", dropna=False)["Records"].sum()
+                .sort_values(ascending=False)
+                .head(8)
+                .index
+            )
+            heat = by_market_type[by_market_type["CUST_BUS_TYP_DSCR"].isin(top_types)].copy()
+            if not heat.empty:
+                fig_heat = px.density_heatmap(
+                    heat,
+                    x="CUST_BUS_TYP_DSCR",
+                    y="XDOCK",
+                    z="Gap_vs_Type_Expected_%",
+                    histfunc="mean",
+                    color_continuous_scale="RdYlGn_r",
+                    title="Market vs customer type gap to type baseline (median CPS)",
+                )
+                fig_heat.update_layout(height=560, xaxis_title="Customer Type", yaxis_title="Market / Xdock")
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+            detail = by_market_type.sort_values("Records", ascending=False).copy()
+            st.dataframe(
+                detail[[
+                    "XDOCK",
+                    "CUST_BUS_TYP_DSCR",
+                    "Records",
+                    "Actual_CPS",
+                    "Expected_CPS_By_Type",
+                    "Gap_vs_Type_Expected_%",
+                ]],
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Actual_CPS": st.column_config.NumberColumn(format="$%.2f"),
+                    "Expected_CPS_By_Type": st.column_config.NumberColumn(format="$%.2f"),
+                    "Gap_vs_Type_Expected_%": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Records": st.column_config.NumberColumn(format="%,d"),
+                },
+            )
 
 
 # --------------------------------------------------------------------------- #
