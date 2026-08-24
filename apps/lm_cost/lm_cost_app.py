@@ -191,8 +191,18 @@ def load_data() -> pd.DataFrame:
     if _on_databricks():
         df = _load_via_spark()
     if df is None:
-        path = os.environ.get("NORM_DATA_PATH") or LOCAL_CSV_PATH
-        df = pd.read_csv(path, low_memory=False)
+        azure_conn = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        azure_container = os.environ.get("AZURE_STORAGE_CONTAINER", "data")
+        azure_blob = os.environ.get("AZURE_STORAGE_BLOB_NAME", "LM_CS_slim.csv.gz")
+        if azure_conn:
+            from azure.storage.blob import BlobClient
+            import io
+            blob = BlobClient.from_connection_string(azure_conn, azure_container, azure_blob)
+            data = blob.download_blob().readall()
+            df = pd.read_csv(io.BytesIO(data), compression="gzip", low_memory=False)
+        else:
+            path = os.environ.get("NORM_DATA_PATH") or LOCAL_CSV_PATH
+            df = pd.read_csv(path, low_memory=False)
     return prepare(df)
 
 
