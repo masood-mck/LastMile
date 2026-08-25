@@ -542,6 +542,76 @@ def build_scorecard(
 
     market["cleansheet_overpay_support"] = market["cleansheet_aggr_gap_pct"].notna() & (market["cleansheet_aggr_gap_pct"] > 0)
     market["cleansheet_underpay_support"] = market["cleansheet_cons_gap_pct"].notna() & (market["cleansheet_cons_gap_pct"] < 0)
+
+    # --- Classification reason ---
+    def _cls_reason(row):
+        parts = []
+        gap_pct = row.get("model_residual_pct", 0) or 0
+        actual = row.get("actual_median_cps", None)
+        p90 = row.get("pred_p90", None)
+        p10 = row.get("pred_p10", None)
+        conf = row.get("confidence", "")
+        paid = row.get("paid_records", 0) or 0
+        cls = row.get("classification", "")
+
+        if cls == "Not enough evidence":
+            if paid < min_group_n:
+                parts.append(f"low volume ({int(paid)} records)")
+            if conf == "Very Low":
+                parts.append("very low confidence")
+            if pd.isna(actual):
+                parts.append("no actual CPS")
+        elif "overpay" in cls.lower():
+            parts.append(f"gap +{gap_pct:.1%} vs expected")
+            if actual is not None and p90 is not None:
+                if actual > p90:
+                    parts.append(f"actual ${actual:.2f} > P90 ${p90:.2f}")
+                else:
+                    parts.append(f"actual ${actual:.2f} within P90 ${p90:.2f}")
+            if row.get("cleansheet_overpay_support"):
+                parts.append(f"cleansheet also high ({row.get('cleansheet_aggr_gap_pct', 0):.1%} above aggressive)")
+        elif "underpay" in cls.lower():
+            parts.append(f"gap {gap_pct:.1%} vs expected")
+            if actual is not None and p10 is not None:
+                if actual < p10:
+                    parts.append(f"actual ${actual:.2f} < P10 ${p10:.2f}")
+                else:
+                    parts.append(f"actual ${actual:.2f} within P10 ${p10:.2f}")
+            if row.get("cleansheet_underpay_support"):
+                parts.append(f"cleansheet also low ({row.get('cleansheet_cons_gap_pct', 0):.1%} vs conservative)")
+        else:
+            parts.append(f"gap {gap_pct:.1%} within thresholds")
+            if actual is not None and p90 is not None:
+                parts.append(f"actual ${actual:.2f} within band [${p10:.2f}–${p90:.2f}]")
+        return "; ".join(parts)
+
+    # --- Confidence reason ---
+    def _conf_reason(row):
+        parts = []
+        paid = row.get("paid_records", 0) or 0
+        zero_rate = row.get("zero_rate", None)
+        sens = row.get("combined_sensitivity_abs_pct", None)
+        if paid >= min_group_n * 3:
+            parts.append(f"high volume ({int(paid)} records)")
+        elif paid >= min_group_n:
+            parts.append(f"adequate volume ({int(paid)} records)")
+        else:
+            parts.append(f"low volume ({int(paid)} records)")
+        if zero_rate is not None:
+            if zero_rate <= 0.35:
+                parts.append(f"low zero-cost rate ({zero_rate:.0%})")
+            else:
+                parts.append(f"high zero-cost rate ({zero_rate:.0%})")
+        if sens is not None:
+            if sens <= 0.40:
+                parts.append(f"stable sensitivity ({sens:.0%})")
+            else:
+                parts.append(f"unstable sensitivity ({sens:.0%})")
+        return "; ".join(parts)
+
+    market["Classification Reason"] = market.apply(_cls_reason, axis=1)
+    market["Confidence Reason"] = market.apply(_conf_reason, axis=1)
+
     market["business_note"] = np.select(
         [
             market["classification"].str.contains("overpay", case=False, na=False) & market["cleansheet_overpay_support"],
@@ -578,6 +648,8 @@ def build_scorecard(
     market["Signal / Classification"] = market["classification"]
     market["Confidence"] = market["confidence"]
     market["Business Note"] = market["business_note"]
+    market["Classification Reason"] = market["Classification Reason"]
+    market["Confidence Reason"] = market["Confidence Reason"]
     market["Records With CPS"] = market["paid_records"]
     market["Total Records"] = market["records"]
     market["Zero Cost Rate"] = market["zero_rate"]
@@ -595,6 +667,8 @@ def build_scorecard(
             "Carrier",
             "Signal / Classification",
             "Confidence",
+            "Classification Reason",
+            "Confidence Reason",
             "Business Note",
             "Total Records",
             "Records With CPS",
