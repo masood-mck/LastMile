@@ -9,6 +9,7 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+COPY data/LM_CS_slim.csv /app/data/LM_CS_slim.csv
 
 EXPOSE 8501
 
