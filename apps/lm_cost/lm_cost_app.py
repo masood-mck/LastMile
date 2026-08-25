@@ -2442,7 +2442,7 @@ with tab10:
                     x="CUST_BUS_TYP_DSCR",
                     y="XDOCK",
                     z="Gap_vs_Type_Expected_%",
-                    histfunc="mean",
+                    histfunc="avg",
                     color_continuous_scale="RdYlGn_r",
                     title="Market vs customer type gap to type baseline (median CPS)",
                 )
