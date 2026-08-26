@@ -1391,6 +1391,71 @@ Confidence labels:
 - Very Low: score <= 1
 
 Very Low confidence groups are treated as Not enough evidence in final classification.
+
+---
+
+### 7. Classification Rules
+
+Classification is assigned in priority order:
+
+#### Strong Overpay Candidate
+All three conditions must be met:
+1. Gap % ≥ strong overpay threshold (default: +20%)
+2. Actual CPS > P90 Expected CPS (actual exceeds the model's upper predicted range)
+3. Confidence is High or Medium
+
+#### Strong Underpay Candidate
+All three conditions must be met:
+1. Gap % ≤ strong underpay threshold (default: -20%)
+2. Actual CPS < P10 Expected CPS (actual is below the model's lower predicted range)
+3. Confidence is High or Medium
+
+#### Possible Overpay
+1. Gap % ≥ possible overpay threshold (default: +10%)
+2. (If P25/P75 enabled) Actual CPS > P75 Expected CPS
+3. Group not already classified as Strong Overpay
+
+#### Possible Underpay
+1. Gap % ≤ possible underpay threshold (default: -10%)
+2. (If P25/P75 enabled) Actual CPS < P25 Expected CPS
+3. Group not already classified as Strong Underpay
+
+#### Not Enough Evidence
+Any of:
+- Paid records below minimum threshold
+- Confidence is Very Low
+- Actual CPS is missing
+- Expected P50 is missing
+
+#### Normal / Inside Expected Band
+All other groups that do not meet any of the above conditions.
+
+---
+
+### 8. Sensitivity Calculation
+
+Sensitivity measures how much the supporting benchmarks (normalized cost, cleansheet) diverge from actual CPS.
+A large divergence means the benchmarks and the actual rate tell very different stories, reducing confidence.
+
+**Normalization Sensitivity:**
+```
+norm_sensitivity = abs((Normalized Cost / Actual CPS) - 1)
+```
+Example: Actual CPS = $30, Normalized Cost = $24 → sensitivity = abs(24/30 - 1) = 20%
+
+**Cleansheet Sensitivity:**
+```
+cleansheet_sensitivity = abs((Cleansheet Midpoint / Actual CPS) - 1)
+```
+Where Cleansheet Midpoint = (Conservative + Aggressive) / 2
+
+**Combined Sensitivity:**
+```
+combined_sensitivity = average(norm_sensitivity, cleansheet_sensitivity)
+```
+
+If combined sensitivity ≤ 40% → benchmarks are aligned with actual CPS → +1 confidence point.
+If combined sensitivity > 40% → benchmarks diverge significantly → business note flags it as "Sensitive to normalization and cleansheet assumptions".
     """)
 
     st.subheader("Current Model Statistics")
