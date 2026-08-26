@@ -46,9 +46,7 @@ st.set_page_config(page_title="Last Mile Cost Intelligence (LMCI)", layout="wide
 # Paths / env
 # --------------------------------------------------------------------------- #
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-_GZ_PATH = os.path.join(_DATA_DIR, "LM_CS_slim.csv.gz")
-_CSV_PATH = os.path.join(_DATA_DIR, "LM_CS_slim.csv")
-LOCAL_CSV_PATH = _GZ_PATH if os.path.exists(_GZ_PATH) else _CSV_PATH
+LOCAL_CSV_PATH = os.path.join(_DATA_DIR, "LM_CS_slim.csv.gz")
 DATABRICKS_TABLE = os.environ.get("NORM_DATA_TABLE", "")
 DATABRICKS_PATH = os.environ.get("NORM_DATA_PATH", "")
 
