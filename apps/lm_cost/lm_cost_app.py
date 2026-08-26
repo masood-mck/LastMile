@@ -1478,6 +1478,8 @@ with tab01:
         "Carrier",
         "Signal / Classification",
         "Confidence",
+        "Classification Reason",
+        "Confidence Reason",
         "Records With CPS",
         "Actual CPS",
         "Expected CPS",
