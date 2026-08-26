@@ -40,7 +40,7 @@ from sklearn.model_selection import train_test_split
 # --------------------------------------------------------------------------- #
 # Page config
 # --------------------------------------------------------------------------- #
-st.set_page_config(page_title="Last Mile Cost Outlier Detection", layout="wide")
+st.set_page_config(page_title="Last Mile Cost Intelligence (LMCI)", layout="wide")
 
 # --------------------------------------------------------------------------- #
 # Paths / env
@@ -947,7 +947,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="app-title">Last Mile Cost Outlier Detection</div>', unsafe_allow_html=True)
+st.markdown('<div class="app-title">Last Mile Cost Intelligence (LMCI)</div>', unsafe_allow_html=True)
 st.markdown('<div class="app-rule"></div>', unsafe_allow_html=True)
 
 try:
