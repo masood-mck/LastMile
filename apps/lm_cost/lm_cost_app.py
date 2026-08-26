@@ -315,7 +315,7 @@ def build_scorecard(
             "Cleansheet Cost Per Stop Aggressive",
         ],
     )
-    keep = list(dict.fromkeys(group_cols + ["XDOCK", "MARKET", "FILL_DC_CD", TARGET, "paid_flag", "zero_cost_flag"] + metric_cols))
+    keep = list(dict.fromkeys(group_cols + ["XDOCK", "MARKET", "FILL_DC_CD", "ROUTE_ID", TARGET, "paid_flag", "zero_cost_flag"] + metric_cols))
     work = df[existing_cols(df, keep)].copy()
 
     # Reduce memory pressure.
@@ -337,6 +337,19 @@ def build_scorecard(
     if paid.empty:
         raise ValueError("No positive paid cost rows available after filters.")
 
+    # Pre-aggregate to route level first (mean CPS per route), then to market level (median of route means).
+    # This matches the notebook's Fabio logic: each route gets equal weight regardless of stop count.
+    if "ROUTE_ID" in paid.columns:
+        route_agg_cols = group_cols + ["ROUTE_ID"]
+        route_agg_cols = existing_cols(paid, route_agg_cols)
+        route_level = paid.groupby(route_agg_cols, dropna=False, observed=True).agg(
+            **{TARGET: (TARGET, "mean"),
+               **{c: (c, "mean") for c in existing_cols(paid, metric_cols)}}
+        ).reset_index()
+        paid_for_agg = route_level
+    else:
+        paid_for_agg = paid
+
     agg_dict = {
         "actual_median_cps": (TARGET, "median"),
         "actual_mean_cps": (TARGET, "mean"),
@@ -346,7 +359,7 @@ def build_scorecard(
     for c in metric_cols:
         agg_dict[f"median_{clean_col_name(c)}"] = (c, "median")
 
-    paid_agg = paid.groupby(group_cols, dropna=False, observed=True).agg(**agg_dict).reset_index()
+    paid_agg = paid_for_agg.groupby(group_cols, dropna=False, observed=True).agg(**agg_dict).reset_index()
     market = counts.merge(paid_agg, on=group_cols, how="left")
 
     market["zero_rate"] = safe_div(market["zero_records"], market["records"])
