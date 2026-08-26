@@ -986,12 +986,12 @@ with st.sidebar:
 
     grain = st.radio(
         "Scoring grain",
-        ["Market only", "Market + carrier"],
+        ["Market only (XDOCK = market + carrier)", "Market + carrier (explicit)"],
         index=0,
-        help="Market only is best for executive market review. Market + carrier is better for sourcing/vendor drilldown.",
+        help="XDOCK code already encodes carrier (e.g. XD_8120_VA_ROANOKE.YZER). 'Market only' is the recommended grain and matches the notebook. 'Market + carrier (explicit)' adds CARRIER_SCAC_CD as an additional grouping.",
     )
     group_cols = ["XDOCK"]
-    if grain == "Market + carrier" and "CARRIER_SCAC_CD" in filtered.columns:
+    if grain == "Market + carrier (explicit)" and "CARRIER_SCAC_CD" in filtered.columns:
         group_cols = ["XDOCK", "CARRIER_SCAC_CD"]
 
     st.divider()
@@ -1041,7 +1041,7 @@ else:
     worst_label, worst_gap = "n/a", np.nan
 
 cards = [
-    ("Scored groups", f"{len(business_view):,}", f"grain: {grain}"),
+    ("Scored groups", f"{len(business_view):,}", f"grain: {'Market (XDOCK)' if 'explicit' not in grain else 'Market + Carrier'}"),
     ("Overpay candidates", f"{strong_over + possible_over:,}", f"strong: {strong_over:,}"),
     ("Underpay signals", f"{underpay:,}", "validate missing charges"),
     ("Highest gap", pct(worst_gap), str(worst_label)[:32]),
