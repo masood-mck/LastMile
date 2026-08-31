@@ -145,10 +145,6 @@ def make_label(df: pd.DataFrame) -> pd.Series:
         label = df["XDOCK"].astype(str)
     else:
         label = df.index.astype(str)
-    if "Carrier" in df.columns:
-        label = label + " | " + df["Carrier"].astype(str)
-    elif "CARRIER_SCAC_CD" in df.columns:
-        label = label + " | " + df["CARRIER_SCAC_CD"].astype(str)
     return label
 
 
@@ -396,7 +392,7 @@ def build_scorecard(
             "median_lastmile_misc_cost",
         ],
     )
-    categorical_features = existing_cols(model_df, ["XDOCK", "CARRIER_SCAC_CD", "FILL_DC_CD"])
+    categorical_features = existing_cols(model_df, ["XDOCK", "FILL_DC_CD"])
     # Do not include the same column as both the grouping identifier and a feature when model rows are very sparse.
     categorical_features = [c for c in categorical_features if c in group_cols]
     feature_cols = numeric_features + categorical_features
@@ -641,11 +637,6 @@ def build_scorecard(
     # Business-ready aliases.
     market["Market / Xdock"] = market["XDOCK"] if "XDOCK" in market.columns else market[group_cols[0]]
     market["Market Name"] = market["Market / Xdock"].map(market_name)
-    if "CARRIER_SCAC_CD" in market.columns:
-        market["Carrier"] = market["CARRIER_SCAC_CD"]
-    else:
-        market["Carrier"] = "All carriers"
-
     market["Actual CPS"] = market["actual_median_cps"]
     market["Expected CPS"] = market["pred_p50"]
     market["Expected Low CPS P10"] = market["pred_p10"]
@@ -674,7 +665,6 @@ def build_scorecard(
         [
             "Market / Xdock",
             "Market Name",
-            "Carrier",
             "Signal / Classification",
             "Confidence",
             "Classification Reason",
@@ -1107,6 +1097,21 @@ def top_action_confidence(row: pd.Series, baselines: dict[str, float]) -> str:
     ranked = ranked_recommendations(row, baselines)
     return ranked[0]["Confidence"] if ranked else "n/a"
 
+
+def second_recommendation(row: pd.Series, baselines: dict[str, float]) -> str:
+    ranked = ranked_recommendations(row, baselines)
+    return ranked[1]["Action"] if len(ranked) > 1 else "n/a"
+
+
+def second_action_impact(row: pd.Series, baselines: dict[str, float]) -> str:
+    ranked = ranked_recommendations(row, baselines)
+    return ranked[1]["Impact"] if len(ranked) > 1 else "n/a"
+
+
+def second_action_confidence(row: pd.Series, baselines: dict[str, float]) -> str:
+    ranked = ranked_recommendations(row, baselines)
+    return ranked[1]["Confidence"] if len(ranked) > 1 else "n/a"
+
 # --------------------------------------------------------------------------- #
 # Styling
 # --------------------------------------------------------------------------- #
@@ -1337,15 +1342,7 @@ with st.sidebar:
         if sel_cust_types:
             filtered = filtered[filtered["CUST_BUS_TYP_DSCR"].astype(str).isin(sel_cust_types)].copy()
 
-    grain = st.radio(
-        "Scoring grain",
-        ["Market only (XDOCK = market + carrier)", "Market + carrier (explicit)"],
-        index=0,
-        help="XDOCK code already encodes carrier (e.g. XD_8120_VA_ROANOKE.YZER). 'Market only' is the recommended grain and matches the notebook. 'Market + carrier (explicit)' adds CARRIER_SCAC_CD as an additional grouping.",
-    )
     group_cols = ["XDOCK"]
-    if grain == "Market + carrier (explicit)" and "CARRIER_SCAC_CD" in filtered.columns:
-        group_cols = ["XDOCK", "CARRIER_SCAC_CD"]
 
     st.divider()
     st.header("Signal thresholds")
@@ -1399,7 +1396,7 @@ else:
     worst_label, worst_gap = "n/a", np.nan
 
 cards = [
-    ("Scored groups", f"{len(business_view):,}", f"grain: {'Market (XDOCK)' if 'explicit' not in grain else 'Market + Carrier'}"),
+    ("Scored groups", f"{len(business_view):,}", "grain: Market (XDOCK)"),
     ("Overpay candidates", f"{overpay_count:,}", "single combined bucket"),
     ("Underpay signals", f"{underpay:,}", "validate missing charges"),
     ("Highest gap", pct(worst_gap), str(worst_label)[:32]),
@@ -1440,7 +1437,12 @@ with st.expander("Quick interpretation", expanded=False):
 st.subheader("1. Market investigation")
 market_options = business_view["Market / Xdock"].astype(str).tolist()
 if market_options:
-    selected_market = st.selectbox("Choose market / xdock", market_options)
+    if "market_picker" not in st.session_state:
+        st.session_state["market_picker"] = market_options[0]
+    if st.session_state.get("market_picker") not in market_options:
+        st.session_state["market_picker"] = market_options[0]
+
+    selected_market = st.selectbox("Choose market / xdock", market_options, key="market_picker")
     row_df = business_view[business_view["Market / Xdock"].astype(str).eq(selected_market)]
     if not row_df.empty:
         row = row_df.iloc[0]
@@ -1492,40 +1494,17 @@ if market_options:
 
         st.caption("The analyzer is rules-based: it compares the selected xdock to peer medians in the current filtered view and turns the strongest deviations into action suggestions.")
 
-        overpay_queue = business_view[business_view["Signal / Classification"].eq("Overpay candidate")].copy()
-        if len(overpay_queue):
-            overpay_queue["Top Root Cause"] = overpay_queue.apply(lambda r: top_root_cause_label(r, rca_baselines), axis=1)
-            overpay_queue["Recommended Action"] = overpay_queue.apply(lambda r: top_recommendation(r, rca_baselines), axis=1)
-            overpay_queue["Action Impact"] = overpay_queue.apply(lambda r: top_action_impact(r, rca_baselines), axis=1)
-            overpay_queue["Action Confidence"] = overpay_queue.apply(lambda r: top_action_confidence(r, rca_baselines), axis=1)
-            st.markdown("### High-cost xdock queue")
-            queue_cols = existing_cols(
-                overpay_queue,
-                [
-                    "Market / Xdock",
-                    "Signal / Classification",
-                    "Confidence",
-                    "CPS Gap vs Expected %",
-                    "Actual CPS",
-                    "Expected CPS",
-                    "Records With CPS",
-                ],
-            )
-            queue_cols += [c for c in ["Top Root Cause", "Recommended Action", "Action Impact", "Action Confidence"] if c in overpay_queue.columns]
-            st.dataframe(
-                overpay_queue.sort_values(["CPS Gap vs Expected %", "Records With CPS"], ascending=[False, False])[queue_cols].head(20),
-                use_container_width=True,
-                hide_index=True,
-            )
+        st.caption("Use the Recommender engine tab for ranked overpay queues, strict all-3-above filtering, and action drilldown.")
 
 # --------------------------------------------------------------------------- #
 # Business charts
 # --------------------------------------------------------------------------- #
 st.subheader("2. Business views")
-tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab10 = st.tabs(
+tab0, tab00, tab11, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab10 = st.tabs(
     [
         "Method Flow",
         "Methodology",
+        "Recommender engine",
         "Signal summary",
         "Cleansheet triangulation",
         "Signal Buckets",
@@ -1545,7 +1524,6 @@ hover_cols = existing_cols(
     [
         "Market / Xdock",
         "Market Name",
-        "Carrier",
         "Signal / Classification",
         "Confidence",
         "Business Note",
@@ -1665,12 +1643,12 @@ Layer 2: Business Validation → Should we trust the opportunity?
             """
 | Category | Features |
 | --- | --- |
-| **Route Operations** | Distance, Stops (route-level), Totes (route-level), Stops (shipment), Totes (shipment), Route Count |
-| **Volume & Quality** | Paid Records, Total Records, Zero Rate, Paid Rate |
-| **Geography** | Geography Multiplier, Geo Mean |
-| **Normalization** | Shipment Norm Multiplier, Miles-per-Stop Norm Multiplier |
-| **Cost Structure** | Total Cost, Base Cost, Fuel Cost, Misc Cost |
-| **Categorical** | Market (XDOCK), Carrier SCAC, Fill DC (when in scoring grain) |
+| **Route Operations** | DISTANCE_VAL, STOP_COUNT_VAL_ROUTE_LVL, TOTE_COUNT_VAL_ROUTE_LVL, STOP_COUNT_VAL, TOTE_COUNT_VAL, ROUTE_COUNT_VAL |
+| **Volume & Quality (count-based)** | paid_records, records, zero_rate, paid_rate |
+| **Geography** | GEOGRAPHY_MULTIPLIER, geo_mean |
+| **Normalization** | shipment_norm_multiplier_qt, miles_per_stop_norm_multiplier_qt, normalized_cost |
+| **Cost Structure** | LASTMILE_TOTAL_COST, LASTMILE_BASE_COST, LASTMILE_FUEL_COST, LASTMILE_MISC_COST |
+| **Categorical** | XDOCK and FILL_DC_CD |
             """
         )
 
@@ -1702,20 +1680,16 @@ The objective is not to find the highest-cost markets. The objective is to ident
 
 ### 1. Market-Level Aggregation
 
-Shipment-level records are aggregated to the selected scoring grain:
-
-- Market only
-- Market + Carrier
+Shipment-level records are aggregated to market/xdock grain (`XDOCK`).
 
 The model uses operational characteristics such as:
 
-- Distance
-- Stops
-- Totes
-- Shipment volume
-- Geography multipliers
-- Density multipliers
-- Cost structure variables
+- `DISTANCE_VAL`
+- `STOP_COUNT_VAL_ROUTE_LVL`, `TOTE_COUNT_VAL_ROUTE_LVL`, `STOP_COUNT_VAL`, `TOTE_COUNT_VAL`
+- `ROUTE_COUNT_VAL` and market-level record counts (`paid_records`, `records`) for count-based volume
+- `GEOGRAPHY_MULTIPLIER`, `geo_mean`
+- `shipment_norm_multiplier_qt`, `miles_per_stop_norm_multiplier_qt`
+- `LASTMILE_TOTAL_COST`, `LASTMILE_BASE_COST`, `LASTMILE_FUEL_COST`, `LASTMILE_MISC_COST`
 
 ---
 
@@ -1878,6 +1852,65 @@ combined_sensitivity = average(norm_sensitivity, cleansheet_sensitivity)
 
 If combined sensitivity ≤ 40% → benchmarks are aligned with actual CPS → +1 confidence point.
 If combined sensitivity > 40% → benchmarks diverge significantly → business note flags it as "Sensitive to normalization and cleansheet assumptions".
+
+---
+
+### 9. Recommender Engine (Action Layer)
+
+The recommender engine is a rules-based prioritization layer that runs after classification.
+It converts model and benchmark signals into ranked actions for each xdock.
+
+#### Data Inputs Used by the Recommender
+
+For each scored market group, the engine consumes:
+
+- Primary signal metrics: Actual CPS, Expected CPS (P50), Gap vs Expected %
+- Benchmark metrics: Normalized Cost, Cleansheet Aggressive, Cleansheet Conservative
+- Confidence context: Records With CPS, Zero Cost Rate, confidence label
+- Operational context: median_distance_val, median_miles_per_stop_norm_multiplier_qt, median_stop_count_val_route_lvl, median_tote_count_val_route_lvl
+- Cost-mix context: base, fuel, and misc cost shares (from market medians)
+
+#### Root-Cause Detection Approach
+
+The root-cause analyzer compares the selected xdock against peer medians in the current filtered population.
+It labels the strongest deviations as contributors (for example, route length, stop-density pressure, fuel-share pressure, benchmark sensitivity).
+
+These labels are explanatory, not predictive: they are designed to support investigation and action design.
+
+#### Action Ranking Approach
+
+The engine scores a fixed action library and returns ranked recommendations.
+Action scores use weighted combinations of:
+
+- Model overage (`max(Actual/Expected - 1, 0)`)
+- Normalized-cost overage (`max(Actual/Normalized - 1, 0)`)
+- Cleansheet overage (`max(Actual/CleansheetAggressive - 1, 0)`)
+- Operational stress indicators (distance excess, miles-per-stop excess, stop-density deficit)
+- Cost-mix signals (fuel/base/misc share)
+
+Profiles:
+
+- Benchmark-heavy: emphasizes normalized and cleansheet evidence
+- Balanced: gives more weight to model residual and route profile
+
+Outputs per action:
+
+- Action text
+- Impact band (High / Medium / Low)
+- Confidence band (High / Medium / Low)
+- Brief reason statement
+
+#### Strict Overpay Queue Rule
+
+The strict overpay queue is a higher-conviction subset for sourcing review.
+A market is included only when all conditions are true:
+
+1. Classified as Overpay candidate
+2. Actual CPS > Expected CPS
+3. Actual CPS > Normalized Cost
+4. Actual CPS > Cleansheet Aggressive
+
+This queue is intended for fastest actioning and includes top root cause plus recommendation 1 and recommendation 2.
     """)
 
     st.subheader("Current Model Statistics")
@@ -1887,6 +1920,153 @@ If combined sensitivity > 40% → benchmarks diverge significantly → business 
         use_container_width=True,
         hide_index=True,
     )
+
+with tab11:
+    st.subheader("Recommender engine")
+    st.caption("Action queues for overpay markets, plus drilldown recommendations.")
+
+    overpay_queue = business_view[business_view["Signal / Classification"].eq("Overpay candidate")].copy()
+    if len(overpay_queue):
+        overpay_queue["Top Root Cause"] = overpay_queue.apply(lambda r: top_root_cause_label(r, rca_baselines), axis=1)
+        overpay_queue["Recommendation 1"] = overpay_queue.apply(lambda r: top_recommendation(r, rca_baselines), axis=1)
+        overpay_queue["Action 1 Impact"] = overpay_queue.apply(lambda r: top_action_impact(r, rca_baselines), axis=1)
+        overpay_queue["Action 1 Confidence"] = overpay_queue.apply(lambda r: top_action_confidence(r, rca_baselines), axis=1)
+        overpay_queue["Recommendation 2"] = overpay_queue.apply(lambda r: second_recommendation(r, rca_baselines), axis=1)
+        overpay_queue["Action 2 Impact"] = overpay_queue.apply(lambda r: second_action_impact(r, rca_baselines), axis=1)
+        overpay_queue["Action 2 Confidence"] = overpay_queue.apply(lambda r: second_action_confidence(r, rca_baselines), axis=1)
+
+        st.markdown("### Overpay queue")
+        queue_cols = existing_cols(
+            overpay_queue,
+            [
+                "Market / Xdock",
+                "Confidence",
+                "CPS Gap vs Expected %",
+                "Actual CPS",
+                "Expected CPS",
+                "Records With CPS",
+                "Top Root Cause",
+                "Recommendation 1",
+                "Action 1 Impact",
+                "Action 1 Confidence",
+                "Recommendation 2",
+                "Action 2 Impact",
+                "Action 2 Confidence",
+            ],
+        )
+        st.dataframe(
+            overpay_queue.sort_values(["CPS Gap vs Expected %", "Records With CPS"], ascending=[False, False])[queue_cols].head(40),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No overpay candidates with the current filters.")
+
+    strict_overpay_queue = business_view[
+        business_view["Signal / Classification"].eq("Overpay candidate")
+        & business_view["Actual CPS"].notna()
+        & business_view["Expected CPS"].notna()
+        & business_view["Normalized Cost"].notna()
+        & business_view["Cleansheet Aggressive"].notna()
+        & (business_view["Actual CPS"] > business_view["Expected CPS"])
+        & (business_view["Actual CPS"] > business_view["Normalized Cost"])
+        & (business_view["Actual CPS"] > business_view["Cleansheet Aggressive"])
+    ].copy()
+
+    st.markdown("### Strict overpay queue (all 3 above benchmark)")
+    st.caption(
+        "Rules: Overpay candidate and Actual CPS > Expected CPS, Actual CPS > Normalized Cost, and Actual CPS > Cleansheet Aggressive."
+    )
+    if len(strict_overpay_queue):
+        strict_overpay_queue["Top Root Cause"] = strict_overpay_queue.apply(lambda r: top_root_cause_label(r, rca_baselines), axis=1)
+        strict_overpay_queue["Recommendation 1"] = strict_overpay_queue.apply(lambda r: top_recommendation(r, rca_baselines), axis=1)
+        strict_overpay_queue["Recommendation 2"] = strict_overpay_queue.apply(lambda r: second_recommendation(r, rca_baselines), axis=1)
+        strict_overpay_queue["Action 1 Impact"] = strict_overpay_queue.apply(lambda r: top_action_impact(r, rca_baselines), axis=1)
+        strict_overpay_queue["Action 1 Confidence"] = strict_overpay_queue.apply(lambda r: top_action_confidence(r, rca_baselines), axis=1)
+        strict_overpay_queue["Action 2 Impact"] = strict_overpay_queue.apply(lambda r: second_action_impact(r, rca_baselines), axis=1)
+        strict_overpay_queue["Action 2 Confidence"] = strict_overpay_queue.apply(lambda r: second_action_confidence(r, rca_baselines), axis=1)
+
+        strict_overpay_queue = strict_overpay_queue.sort_values(["CPS Gap vs Expected %", "Records With CPS"], ascending=[False, False])
+        strict_cols = existing_cols(
+            strict_overpay_queue,
+            [
+                "Market / Xdock",
+                "Confidence",
+                "CPS Gap vs Expected %",
+                "Actual CPS",
+                "Expected CPS",
+                "Normalized Cost",
+                "Cleansheet Aggressive",
+                "Records With CPS",
+                "Top Root Cause",
+                "Recommendation 1",
+                "Action 1 Impact",
+                "Action 1 Confidence",
+                "Recommendation 2",
+                "Action 2 Impact",
+                "Action 2 Confidence",
+            ],
+        )
+        strict_show = strict_overpay_queue[strict_cols]
+
+        selected_from_queue = None
+        try:
+            queue_event = st.dataframe(
+                strict_show,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="strict_overpay_queue_table",
+            )
+            selected_rows = queue_event.get("selection", {}).get("rows", []) if isinstance(queue_event, dict) else []
+            if selected_rows:
+                selected_from_queue = strict_overpay_queue.iloc[selected_rows[0]]["Market / Xdock"]
+        except TypeError:
+            st.dataframe(
+                strict_show,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        strict_market_options = strict_overpay_queue["Market / Xdock"].astype(str).tolist()
+        if selected_from_queue and selected_from_queue in market_options:
+            st.session_state["market_picker"] = selected_from_queue
+
+        if strict_market_options:
+            if "strict_overpay_picker" not in st.session_state:
+                st.session_state["strict_overpay_picker"] = strict_market_options[0]
+            if st.session_state.get("strict_overpay_picker") not in strict_market_options:
+                st.session_state["strict_overpay_picker"] = strict_market_options[0]
+            if selected_from_queue and selected_from_queue in strict_market_options:
+                st.session_state["strict_overpay_picker"] = selected_from_queue
+
+            selected_strict_market = st.selectbox(
+                "Drilldown market from strict queue",
+                strict_market_options,
+                key="strict_overpay_picker",
+            )
+            if selected_strict_market in market_options:
+                st.session_state["market_picker"] = selected_strict_market
+
+            strict_row_df = strict_overpay_queue[
+                strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_strict_market)
+            ]
+            if not strict_row_df.empty:
+                strict_row = strict_row_df.iloc[0]
+                strict_ranked = ranked_recommendations(strict_row, rca_baselines)
+                st.markdown("#### Strict queue drilldown recommendations")
+                if strict_ranked:
+                    rec1 = strict_ranked[0]
+                    st.markdown(f"1. {rec1['Action']} ({rec1['Impact']} impact, {rec1['Confidence']} confidence)")
+                    st.caption(rec1["Reason"])
+                if len(strict_ranked) > 1:
+                    rec2 = strict_ranked[1]
+                    st.markdown(f"2. {rec2['Action']} ({rec2['Impact']} impact, {rec2['Confidence']} confidence)")
+                    st.caption(rec2["Reason"])
+                st.caption("Selecting a market here also updates the main market-investigation picker above.")
+    else:
+        st.info("No xdock meets the strict all-3-above condition with the current filters.")
 
 with tab01:
     st.subheader("1. Signal summary and drilldown")
@@ -1962,7 +2142,6 @@ with tab01:
 
     key_cols = [
         "Market / Xdock",
-        "Carrier",
         "Signal / Classification",
         "Confidence",
         "Classification Reason",
@@ -2129,7 +2308,6 @@ with tab4:
             size="Records With CPS",
             hover_data={
                 "Market / Xdock": True,
-                "Carrier": True,
                 "Signal / Classification": True,
 
                 "Actual CPS": ":,.2f",
@@ -2260,7 +2438,6 @@ with tab4:
             top_quad[
                 [
                     "Market / Xdock",
-                    "Carrier",
                     "Signal / Classification",
                     "Actual CPS",
                     "Expected CPS",
@@ -2439,7 +2616,6 @@ with tab6:
             size="Records With CPS",
             hover_data=[
                 "Market / Xdock",
-                "Carrier",
                 "Actual CPS",
                 "Expected CPS",
                 "Normalized Cost",
@@ -2496,7 +2672,6 @@ with tab7:
             color="Signal / Classification",
             hover_data=[
                 "Market / Xdock",
-                "Carrier",
                 "Actual CPS",
                 "Expected CPS",
                 "Normalized Cost",
@@ -2552,7 +2727,6 @@ with tab8:
             size="Records With CPS",
             hover_data=[
                 "Market / Xdock",
-                "Carrier",
                 "Actual CPS",
                 "Expected CPS",
                 "Normalized Cost",
@@ -2872,7 +3046,6 @@ Interpretation:
 
                 detail_cols = [
                     "Market / Xdock",
-                    "Carrier",
                     "Signal / Classification",
                     "Confidence",
                     "Actual CPS",
@@ -2933,11 +3106,6 @@ with tab10:
         if paid_rows.empty:
             st.info("No paid rows available for customer-type analysis under current filters.")
         else:
-            if "CARRIER_SCAC_CD" in paid_rows.columns:
-                paid_rows["Carrier"] = paid_rows["CARRIER_SCAC_CD"].astype(str)
-            else:
-                paid_rows["Carrier"] = "All carriers"
-
             type_summary = (
                 paid_rows.groupby("CUST_BUS_TYP_DSCR", dropna=False)
                 .agg(
@@ -3040,7 +3208,7 @@ with st.expander("Methodology and model diagnostics"):
     st.markdown(
         """
         **Approach**
-        - Aggregate shipment-level rows to the selected scoring grain before modeling.
+        - Aggregate shipment-level rows to market/xdock grain (`XDOCK`) before modeling.
         - Use positive paid rows to calculate market-level actual median CPS.
         - Fit a quantile gradient boosting model to estimate expected CPS bands.
         - P50 is the expected median CPS. P10/P90 define the low/high expected range.
