@@ -32,9 +32,11 @@ import streamlit as st
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error, median_absolute_error, r2_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, median_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
 # --------------------------------------------------------------------------- #
@@ -79,6 +81,8 @@ CLASS_COLORS = {
     "Strong underpay candidate": MCK_OLIVE,
     "Not enough evidence": MCK_GRAY,
 }
+
+RECOMMENDER_MODEL_PACK: dict | None = None
 
 # --------------------------------------------------------------------------- #
 # Utility helpers
@@ -984,7 +988,7 @@ def _impact_band(score: float) -> str:
     return "Low"
 
 
-def ranked_recommendations(row: pd.Series, baselines: dict[str, float]) -> list[dict[str, str]]:
+def ranked_recommendations(row: pd.Series, baselines: dict[str, float], use_hybrid: bool = True) -> list[dict[str, str]]:
     profile = str(baselines.get("recommender_profile", "Benchmark-heavy")).strip()
     if profile not in {"Benchmark-heavy", "Balanced"}:
         profile = "Benchmark-heavy"
@@ -997,6 +1001,8 @@ def ranked_recommendations(row: pd.Series, baselines: dict[str, float]) -> list[
     model_gap = max((actual / expected) - 1, 0.0) if pd.notna(actual) and pd.notna(expected) and expected > 0 else 0.0
     norm_gap = max((actual / normalized) - 1, 0.0) if pd.notna(actual) and pd.notna(normalized) and normalized > 0 else 0.0
     clean_gap = max((actual / clean_aggr) - 1, 0.0) if pd.notna(actual) and pd.notna(clean_aggr) and clean_aggr > 0 else 0.0
+
+    action_probabilities = recommendation_action_probabilities(row) if use_hybrid else {}
 
     zero_rate = float(row.get("Zero Cost Rate", 0) or 0)
     distance = float(row.get("median_distance_val", 0) or 0)
@@ -1083,11 +1089,28 @@ def ranked_recommendations(row: pd.Series, baselines: dict[str, float]) -> list[
         ]
 
     for row_item in action_rows:
+        base_score = float(row_item["Score"])
+        ml_probability = float(action_probabilities.get(row_item["Action"], np.nan)) if action_probabilities else np.nan
+        if pd.notna(ml_probability):
+            row_item["ML Probability"] = ml_probability
+            row_item["Score"] = float((0.70 * base_score) + (0.30 * ml_probability))
+        else:
+            row_item["ML Probability"] = np.nan
+            row_item["Score"] = base_score
         row_item["Impact"] = _impact_band(float(row_item["Score"]))
-        row_item["Confidence"] = _impact_band(float((0.6 * benchmark_alignment) + (0.4 * row_item["Score"])))
+        confidence_basis = (0.45 * benchmark_alignment) + (0.25 * base_score)
+        if pd.notna(ml_probability):
+            confidence_basis += 0.30 * ml_probability
+        else:
+            confidence_basis += 0.30 * base_score
+        row_item["Confidence"] = _impact_band(float(confidence_basis))
 
     ranked = sorted(action_rows, key=lambda x: x["Score"], reverse=True)
     return ranked
+
+
+def ranked_recommendations_rules(row: pd.Series, baselines: dict[str, float]) -> list[dict[str, str]]:
+    return ranked_recommendations(row, baselines, use_hybrid=False)
 
 
 def top_root_cause_label(row: pd.Series, baselines: dict[str, float]) -> str:
@@ -1123,6 +1146,210 @@ def second_action_impact(row: pd.Series, baselines: dict[str, float]) -> str:
 def second_action_confidence(row: pd.Series, baselines: dict[str, float]) -> str:
     ranked = ranked_recommendations(row, baselines)
     return ranked[1]["Confidence"] if len(ranked) > 1 else "n/a"
+
+
+def render_recommendation_detail_body(row: pd.Series, baselines: dict[str, float]) -> None:
+    ranked = ranked_recommendations(row, baselines)
+    st.markdown(f"**Market / Xdock:** {row.get('Market / Xdock', 'n/a')}")
+    st.markdown(
+        f"- Actual CPS: {money(row.get('Actual CPS'))}"
+        f" | Expected CPS: {money(row.get('Expected CPS'))}"
+        f" | Gap: {pct(row.get('CPS Gap vs Expected %'))}"
+    )
+    st.markdown(
+        f"- Normalized Cost: {money(row.get('Normalized Cost'))}"
+        f" | Cleansheet Aggressive: {money(row.get('Cleansheet Aggressive'))}"
+        f" | Records With CPS: {int(row.get('Records With CPS', 0)):,}"
+    )
+    st.markdown(f"- Top root cause: {root_cause_summary(row, baselines)}")
+
+    if ranked:
+        display_rows = []
+        for idx, action in enumerate(ranked[:5], start=1):
+            display_rows.append(
+                {
+                    "Rank": idx,
+                    "Action": action.get("Action", "n/a"),
+                    "Impact": action.get("Impact", "n/a"),
+                    "Confidence": action.get("Confidence", "n/a"),
+                    "Hybrid Score": float(action.get("Score", np.nan)) if pd.notna(action.get("Score", np.nan)) else np.nan,
+                    "ML Probability": float(action.get("ML Probability", np.nan)) if pd.notna(action.get("ML Probability", np.nan)) else np.nan,
+                    "Reason": action.get("Reason", ""),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(display_rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Hybrid Score": st.column_config.NumberColumn(format="%.3f"),
+                "ML Probability": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+
+
+if hasattr(st, "dialog"):
+    @st.dialog("Recommendation details", width="large")
+    def open_recommendation_popup(section_title: str, row: pd.Series, baselines: dict[str, float]) -> None:
+        st.markdown(f"### {section_title}")
+        render_recommendation_detail_body(row, baselines)
+else:
+    def open_recommendation_popup(section_title: str, row: pd.Series, baselines: dict[str, float]) -> None:
+        st.markdown(f"### {section_title}")
+        render_recommendation_detail_body(row, baselines)
+
+
+def recommendation_feature_columns(df: pd.DataFrame) -> list[str]:
+    return existing_cols(
+        df,
+        [
+            "Actual CPS",
+            "Expected CPS",
+            "CPS Gap vs Expected %",
+            "Normalized Cost",
+            "Gap vs Conservative Cleansheet %",
+            "Gap vs Aggressive Cleansheet %",
+            "Normalization Sensitivity",
+            "Cleansheet Sensitivity",
+            "Combined Sensitivity",
+            "Records With CPS",
+            "Total Records",
+            "Zero Cost Rate",
+            "Confidence Score",
+            "median_distance_val",
+            "median_miles_per_stop_norm_multiplier_qt",
+            "median_stop_count_val_route_lvl",
+            "median_tote_count_val_route_lvl",
+            "median_geography_multiplier",
+            "median_geo_mean",
+            "median_lastmile_total_cost",
+            "median_lastmile_base_cost",
+            "median_lastmile_fuel_cost",
+            "median_lastmile_misc_cost",
+        ],
+    )
+
+
+def recommendation_confidence_score(row: pd.Series) -> float:
+    confidence = str(row.get("Confidence", "")).strip()
+    mapping = {"High": 3.0, "Medium": 2.0, "Low": 1.0, "Very Low": 0.0}
+    return mapping.get(confidence, 0.0)
+
+
+def recommendation_action_probabilities(row: pd.Series) -> dict[str, float]:
+    pack = RECOMMENDER_MODEL_PACK
+    if not pack or pack.get("status") != "hybrid model":
+        return {}
+
+    model = pack.get("model")
+    feature_cols = pack.get("feature_cols", [])
+    if model is None or not feature_cols:
+        return {}
+
+    row_df = pd.DataFrame([row]).reindex(columns=feature_cols)
+    try:
+        probs = model.predict_proba(row_df)[0]
+    except Exception:
+        return {}
+
+    actions = list(model.named_steps["model"].classes_)
+    return {action: float(prob) for action, prob in zip(actions, probs)}
+
+
+def _recommendation_training_frame(df: pd.DataFrame) -> pd.DataFrame:
+    train_df = df.copy()
+    required = existing_cols(
+        train_df,
+        ["Actual CPS", "Expected CPS", "CPS Gap vs Expected %", "Normalized Cost", "Records With CPS", "Zero Cost Rate"],
+    )
+    if len(required) < 4:
+        return train_df.iloc[0:0].copy()
+    train_df = train_df[train_df[required].notna().all(axis=1)].copy()
+    if "Signal / Classification" in train_df.columns:
+        train_df = train_df[train_df["Signal / Classification"].notna()].copy()
+    return train_df
+
+
+@st.cache_data(show_spinner="Training hybrid recommender...")
+def train_recommendation_agent(df: pd.DataFrame, baselines: dict[str, float], random_state: int = 42) -> dict:
+    train_df = _recommendation_training_frame(df)
+    train_df["Confidence Score"] = train_df.apply(recommendation_confidence_score, axis=1)
+    feature_cols = recommendation_feature_columns(train_df)
+    if len(train_df) < 40 or len(feature_cols) < 6:
+        return {
+            "status": "fallback",
+            "model": None,
+            "feature_cols": feature_cols,
+            "metrics": {
+                "training_rows": int(len(train_df)),
+                "feature_count": int(len(feature_cols)),
+                "model_status": "fallback rules-only",
+            },
+        }
+
+    labeled_df = train_df.copy()
+    labeled_df["Agent Top Action"] = labeled_df.apply(
+        lambda r: ranked_recommendations(r, baselines, use_hybrid=False)[0]["Action"],
+        axis=1,
+    )
+
+    action_counts = labeled_df["Agent Top Action"].value_counts()
+    if action_counts.nunique() == 0 or action_counts.min() < 2 or action_counts.shape[0] < 2:
+        return {
+            "status": "fallback",
+            "model": None,
+            "feature_cols": feature_cols,
+            "metrics": {
+                "training_rows": int(len(train_df)),
+                "feature_count": int(len(feature_cols)),
+                "model_status": "fallback insufficient action labels",
+            },
+        }
+
+    X = labeled_df[feature_cols].copy()
+    y = labeled_df["Agent Top Action"].astype(str).copy()
+    stratify = y if y.nunique() > 1 and y.value_counts().min() >= 2 else None
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.20,
+        random_state=random_state,
+        stratify=stratify,
+    )
+
+    pipe = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                LogisticRegression(
+                    max_iter=2000,
+                    class_weight="balanced",
+                    multi_class="multinomial",
+                    random_state=random_state,
+                ),
+            ),
+        ]
+    )
+    pipe.fit(X_train, y_train)
+
+    y_pred = pipe.predict(X_test)
+    metrics = {
+        "training_rows": int(len(labeled_df)),
+        "feature_count": int(len(feature_cols)),
+        "action_classes": int(y.nunique()),
+        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "macro_f1": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
+        "model_status": "hybrid model",
+    }
+
+    return {
+        "status": "hybrid model",
+        "model": pipe,
+        "feature_cols": feature_cols,
+        "metrics": metrics,
+    }
 
 # --------------------------------------------------------------------------- #
 # Styling
@@ -1435,6 +1662,8 @@ for col in [
     if col in business_view.columns:
         rca_baselines[col] = business_view[col].median(skipna=True)
 
+RECOMMENDER_MODEL_PACK = train_recommendation_agent(business_view, rca_baselines)
+
 with st.expander("Quick interpretation", expanded=False):
     st.markdown(
         f"- {overpay_count:,} overpay candidates, {underpay:,} underpay signals, and {not_enough:,} groups with not enough evidence."
@@ -1506,7 +1735,7 @@ if market_options:
 
         st.caption("The analyzer is rules-based: it compares the selected xdock to peer medians in the current filtered view and turns the strongest deviations into action suggestions.")
 
-        st.caption("Use the Recommender engine tab for ranked overpay queues, strict all-3-above filtering, and action drilldown.")
+        st.caption("Use the Recommender agent tab for ranked overpay queues, strict all-3-above filtering, and action drilldown.")
 
 # --------------------------------------------------------------------------- #
 # Business charts
@@ -1516,7 +1745,7 @@ tab0, tab00, tab11, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8,
     [
         "Method Flow",
         "Methodology",
-        "Recommender engine",
+        "Recommender agent",
         "Signal summary",
         "Cleansheet triangulation",
         "Signal Buckets",
@@ -1867,62 +2096,47 @@ If combined sensitivity > 40% → benchmarks diverge significantly → business 
 
 ---
 
-### 9. Recommender Engine (Action Layer)
+### 9. Recommender Agent (Current Implementation)
 
-The recommender engine is a rules-based prioritization layer that runs after classification.
-It converts model and benchmark signals into ranked actions for each xdock.
+The recommender agent is a hybrid layer that ranks actions after the market is classified.
 
-#### Data Inputs Used by the Recommender
+#### What it does today
 
-For each scored market group, the engine consumes:
+- The app first produces a rules-based action ranking for each xdock.
+- The ML layer then learns the top agent action from the current scored view as a pseudo-label.
+- At inference time, the ML model predicts action probabilities and blends them with the rules-based scores.
 
-- Primary signal metrics: Actual CPS, Expected CPS (P50), Gap vs Expected %
-- Benchmark metrics: Normalized Cost, Cleansheet Aggressive, Cleansheet Conservative
-- Confidence context: Records With CPS, Zero Cost Rate, confidence label
-- Operational context: median_distance_val, median_miles_per_stop_norm_multiplier_qt, median_stop_count_val_route_lvl, median_tote_count_val_route_lvl
-- Cost-mix context: base, fuel, and misc cost shares (from market medians)
+#### Current ML target
 
-#### Root-Cause Detection Approach
+- The training target is `Agent Top Action`, which is the top action produced by the current rules engine.
+- This means the recommender is currently learning the agent’s behavior, not real commercial outcomes.
+- It is not yet trained on labels like accepted recommendation, realized savings, or before/after CPS.
 
-The root-cause analyzer compares the selected xdock against peer medians in the current filtered population.
-It labels the strongest deviations as contributors (for example, route length, stop-density pressure, fuel-share pressure, benchmark sensitivity).
+#### ML features used
 
-These labels are explanatory, not predictive: they are designed to support investigation and action design.
+- Actual CPS, Expected CPS, CPS Gap vs Expected %
+- Normalized Cost and cleansheet gaps
+- Records With CPS, Total Records, Zero Cost Rate, Confidence Score
+- Route-level medians such as distance, miles-per-stop, stop count, tote count, geography multiplier, and cost mix
 
-#### Action Ranking Approach
+#### Model type
 
-The engine scores a fixed action library and returns ranked recommendations.
-Action scores use weighted combinations of:
+- Multinomial Logistic Regression
+- Median imputation
+- Standard scaling
+- 80/20 train-test split
+- Balanced class weights
 
-- Model overage (`max(Actual/Expected - 1, 0)`)
-- Normalized-cost overage (`max(Actual/Normalized - 1, 0)`)
-- Cleansheet overage (`max(Actual/CleansheetAggressive - 1, 0)`)
-- Operational stress indicators (distance excess, miles-per-stop excess, stop-density deficit)
-- Cost-mix signals (fuel/base/misc share)
+#### Blend logic
 
-Profiles:
+- Rules-based score remains the primary signal.
+- ML action probability is blended into the action score.
+- If the current filtered data is too small or too sparse, the app falls back to rules-only.
 
-- Benchmark-heavy: emphasizes normalized and cleansheet evidence
-- Balanced: gives more weight to model residual and route profile
+#### Interpretation
 
-Outputs per action:
-
-- Action text
-- Impact band (High / Medium / Low)
-- Confidence band (High / Medium / Low)
-- Brief reason statement
-
-#### Strict Overpay Queue Rule
-
-The strict overpay queue is a higher-conviction subset for sourcing review.
-A market is included only when all conditions are true:
-
-1. Classified as Overpay candidate
-2. Actual CPS > Expected CPS
-3. Actual CPS > Normalized Cost
-4. Actual CPS > Cleansheet Aggressive
-
-This queue is intended for fastest actioning and includes top root cause plus recommendation 1 and recommendation 2.
+- This is a hybrid recommender, not a true outcome-trained recommender yet.
+- To make it data-based in the commercial sense, the app needs a real target table with review decisions or realized savings.
     """)
 
     st.subheader("Current Model Statistics")
@@ -1934,8 +2148,16 @@ This queue is intended for fastest actioning and includes top root cause plus re
     )
 
 with tab11:
-    st.subheader("Recommender engine")
+    st.subheader("Recommender agent")
     st.caption("Action queues for overpay markets, plus drilldown recommendations.")
+    st.caption("Expected CPS is generated by an ML model; recommendation ranking blends an ML action-probability model with rules-based agent scoring.")
+
+    if RECOMMENDER_MODEL_PACK.get("status") == "hybrid model":
+        st.success("Hybrid recommender active: ML action ranking is blended with agent rules.")
+    else:
+        st.info("Hybrid recommender fallback: rules-based agent only because the current filtered view is too small or too sparse for ML training.")
+
+    st.dataframe(pd.DataFrame([RECOMMENDER_MODEL_PACK.get("metrics", {})]), use_container_width=True, hide_index=True)
 
     overpay_queue = business_view[business_view["Signal / Classification"].eq("Overpay candidate")].copy()
     if len(overpay_queue):
@@ -1989,6 +2211,12 @@ with tab11:
                 hide_index=True,
             )
 
+        if selected_from_overpay_queue and selected_from_overpay_queue != st.session_state.get("overpay_popup_last_market"):
+            st.session_state["overpay_popup_last_market"] = selected_from_overpay_queue
+            popup_row_df = overpay_queue[overpay_queue["Market / Xdock"].astype(str).eq(selected_from_overpay_queue)]
+            if not popup_row_df.empty:
+                open_recommendation_popup("Overpay queue drilldown", popup_row_df.iloc[0], rca_baselines)
+
         overpay_market_options = overpay_queue["Market / Xdock"].astype(str).tolist()
         if overpay_market_options:
             if "overpay_picker" not in st.session_state:
@@ -2004,34 +2232,18 @@ with tab11:
                 key="overpay_picker",
             )
 
+            if st.button("Open overpay drilldown popup", key="open_overpay_popup_btn"):
+                selected_row_df = overpay_queue[
+                    overpay_queue["Market / Xdock"].astype(str).eq(selected_overpay_market)
+                ]
+                if not selected_row_df.empty:
+                    open_recommendation_popup("Overpay queue drilldown", selected_row_df.iloc[0], rca_baselines)
+
             overpay_row_df = overpay_queue[
                 overpay_queue["Market / Xdock"].astype(str).eq(selected_overpay_market)
             ]
             if not overpay_row_df.empty:
-                overpay_row = overpay_row_df.iloc[0]
-                overpay_ranked = ranked_recommendations(overpay_row, rca_baselines)
-
-                st.markdown("#### Overpay queue drilldown")
-                st.markdown(
-                    f"- Actual CPS: {money(overpay_row.get('Actual CPS'))}"
-                    f" | Expected CPS: {money(overpay_row.get('Expected CPS'))}"
-                    f" | Gap: {pct(overpay_row.get('CPS Gap vs Expected %'))}"
-                )
-                st.markdown(
-                    f"- Normalized Cost: {money(overpay_row.get('Normalized Cost'))}"
-                    f" | Cleansheet Aggressive: {money(overpay_row.get('Cleansheet Aggressive'))}"
-                    f" | Records With CPS: {int(overpay_row.get('Records With CPS', 0)):,}"
-                )
-                st.markdown(f"- Top root cause: {root_cause_summary(overpay_row, rca_baselines)}")
-
-                if overpay_ranked:
-                    rec1 = overpay_ranked[0]
-                    st.markdown(f"1. {rec1['Action']} ({rec1['Impact']} impact, {rec1['Confidence']} confidence)")
-                    st.caption(rec1["Reason"])
-                if len(overpay_ranked) > 1:
-                    rec2 = overpay_ranked[1]
-                    st.markdown(f"2. {rec2['Action']} ({rec2['Impact']} impact, {rec2['Confidence']} confidence)")
-                    st.caption(rec2["Reason"])
+                st.caption("Select a row to open popup details, or use the button to open the selected market.")
     else:
         st.info("No overpay candidates with the current filters.")
 
@@ -2102,6 +2314,12 @@ with tab11:
                 hide_index=True,
             )
 
+        if selected_from_queue and selected_from_queue != st.session_state.get("strict_popup_last_market"):
+            st.session_state["strict_popup_last_market"] = selected_from_queue
+            popup_row_df = strict_overpay_queue[strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_from_queue)]
+            if not popup_row_df.empty:
+                open_recommendation_popup("Strict overpay drilldown", popup_row_df.iloc[0], rca_baselines)
+
         strict_market_options = strict_overpay_queue["Market / Xdock"].astype(str).tolist()
         if strict_market_options:
             if "strict_overpay_picker" not in st.session_state:
@@ -2117,34 +2335,18 @@ with tab11:
                 key="strict_overpay_picker",
             )
 
+            if st.button("Open strict drilldown popup", key="open_strict_popup_btn"):
+                selected_row_df = strict_overpay_queue[
+                    strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_strict_market)
+                ]
+                if not selected_row_df.empty:
+                    open_recommendation_popup("Strict overpay drilldown", selected_row_df.iloc[0], rca_baselines)
+
             strict_row_df = strict_overpay_queue[
                 strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_strict_market)
             ]
             if not strict_row_df.empty:
-                strict_row = strict_row_df.iloc[0]
-                strict_ranked = ranked_recommendations(strict_row, rca_baselines)
-
-                st.markdown("#### Strict queue drilldown")
-                st.markdown(
-                    f"- Actual CPS: {money(strict_row.get('Actual CPS'))}"
-                    f" | Expected CPS: {money(strict_row.get('Expected CPS'))}"
-                    f" | Gap: {pct(strict_row.get('CPS Gap vs Expected %'))}"
-                )
-                st.markdown(
-                    f"- Normalized Cost: {money(strict_row.get('Normalized Cost'))}"
-                    f" | Cleansheet Aggressive: {money(strict_row.get('Cleansheet Aggressive'))}"
-                    f" | Records With CPS: {int(strict_row.get('Records With CPS', 0)):,}"
-                )
-                st.markdown(f"- Top root cause: {root_cause_summary(strict_row, rca_baselines)}")
-
-                if strict_ranked:
-                    rec1 = strict_ranked[0]
-                    st.markdown(f"1. {rec1['Action']} ({rec1['Impact']} impact, {rec1['Confidence']} confidence)")
-                    st.caption(rec1["Reason"])
-                if len(strict_ranked) > 1:
-                    rec2 = strict_ranked[1]
-                    st.markdown(f"2. {rec2['Action']} ({rec2['Impact']} impact, {rec2['Confidence']} confidence)")
-                    st.caption(rec2["Reason"])
+                st.caption("Select a row to open popup details, or use the button to open the selected market.")
     else:
         st.info("No xdock meets the strict all-3-above condition with the current filters.")
 
