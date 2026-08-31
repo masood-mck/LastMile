@@ -73,8 +73,7 @@ MCK_NAVY = "#002855"
 MCK_LOGO = "https://www.mckesson.com/siteassets/images/z-mckesson-logosicons/mck_logo_blue.svg"
 
 CLASS_COLORS = {
-    "Strong overpay candidate": MCK_RED,
-    "Possible overpay": "#F05A28",
+    "Overpay candidate": MCK_RED,
     "Normal / inside expected band": MCK_BLUE,
     "Possible underpay": MCK_GREEN,
     "Strong underpay candidate": MCK_OLIVE,
@@ -545,8 +544,8 @@ def build_scorecard(
         overpay_possible_condition = market["model_residual_pct"] >= overpay_possible
         underpay_possible_condition = market["model_residual_pct"] <= underpay_possible
 
-    market.loc[(market["model_residual_pct"] >= overpay_strong) & (market["actual_median_cps"] > market["pred_p90"]) & strong_conf, "classification"] = "Strong overpay candidate"
-    market.loc[market["classification"].eq("Normal / inside expected band") & overpay_possible_condition, "classification"] = "Possible overpay"
+    market.loc[(market["model_residual_pct"] >= overpay_strong) & (market["actual_median_cps"] > market["pred_p90"]) & strong_conf, "classification"] = "Overpay candidate"
+    market.loc[market["classification"].eq("Normal / inside expected band") & overpay_possible_condition, "classification"] = "Overpay candidate"
     market.loc[(market["model_residual_pct"] <= underpay_strong) & (market["actual_median_cps"] < market["pred_p10"]) & strong_conf, "classification"] = "Strong underpay candidate"
     market.loc[market["classification"].eq("Normal / inside expected band") & underpay_possible_condition, "classification"] = "Possible underpay"
     market.loc[(market["paid_records"] < min_group_n) | market["confidence"].eq("Very Low") | market["actual_median_cps"].isna() | market["pred_p50"].isna(), "classification"] = "Not enough evidence"
@@ -715,14 +714,13 @@ def classification_summary_text(business_view: pd.DataFrame, metrics: dict) -> l
     out = []
     total = len(business_view)
     counts = business_view["Signal / Classification"].value_counts()
-    strong_over = int(counts.get("Strong overpay candidate", 0))
-    poss_over = int(counts.get("Possible overpay", 0))
+    overpay = int(counts.get("Overpay candidate", 0))
     strong_under = int(counts.get("Strong underpay candidate", 0))
     poss_under = int(counts.get("Possible underpay", 0))
     not_enough = int(counts.get("Not enough evidence", 0))
 
     out.append(
-        f"The tool scored {total:,} market groups. It identified {strong_over:,} strong overpay candidates and {poss_over:,} possible overpay candidates."
+        f"The tool scored {total:,} market groups. It identified {overpay:,} overpay candidates."
     )
     if strong_under + poss_under > 0:
         out.append(f"It also found {strong_under + poss_under:,} underpay signals. Treat underpay as a validation queue, not an immediate savings opportunity, because low cost can also indicate missing charges or incomplete invoices.")
@@ -766,6 +764,348 @@ def row_investigation_text(row: pd.Series) -> list[str]:
     if row.get("Business Note", ""):
         out.append(f"Business note: {row.get('Business Note')}")
     return out
+
+
+def _fmt_issue_value(value, kind: str) -> str:
+    if pd.isna(value):
+        return "n/a"
+    try:
+        if kind == "money":
+            return money(value)
+        if kind == "pct":
+            return pct(value)
+        if kind == "plain_pct":
+            return plain_pct(value)
+        if kind == "int":
+            return f"{int(round(float(value))):,}"
+        if kind == "num":
+            return f"{float(value):,.1f}"
+        return f"{float(value):,.2f}"
+    except Exception:
+        return str(value)
+
+
+def _root_cause_items(row: pd.Series, baselines: dict[str, float]) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+
+    def add(label: str, detail: str, severity: int, recommendation: str):
+        items.append(
+            {
+                "label": label,
+                "detail": detail,
+                "severity": str(severity),
+                "recommendation": recommendation,
+            }
+        )
+
+    records_with_cps = row.get("Records With CPS", 0) or 0
+    min_group_n = int(baselines.get("min_group_n", 0) or 0)
+    if records_with_cps < min_group_n:
+        add(
+            "Low evidence / thin volume",
+            f"{_fmt_issue_value(records_with_cps, 'int')} paid rows vs minimum {min_group_n:,}.",
+            5,
+            "Validate invoices, missing cost capture, and data completeness before commercial action.",
+        )
+
+    zero_cost_rate = row.get("Zero Cost Rate", np.nan)
+    if pd.notna(zero_cost_rate) and zero_cost_rate > 0.35:
+        add(
+            "High zero-cost exposure",
+            f"Zero-cost rate is {_fmt_issue_value(zero_cost_rate, 'pct')}.",
+            5,
+            "Check missing invoices, suppressed charges, and whether the row is under-billed or incomplete.",
+        )
+
+    distance = row.get("median_distance_val", np.nan)
+    baseline_distance = baselines.get("median_distance_val", np.nan)
+    if pd.notna(distance) and pd.notna(baseline_distance) and baseline_distance > 0 and distance >= baseline_distance * 1.15:
+        add(
+            "Long route length",
+            f"Median distance {_fmt_issue_value(distance, 'num')} is above peer median {_fmt_issue_value(baseline_distance, 'num')}.",
+            4,
+            "Review route sequencing, stop consolidation, and whether the market should be served from a different DC or delivery pattern.",
+        )
+
+    miles_per_stop = row.get("median_miles_per_stop_norm_multiplier_qt", np.nan)
+    baseline_miles_per_stop = baselines.get("median_miles_per_stop_norm_multiplier_qt", np.nan)
+    if pd.notna(miles_per_stop) and pd.notna(baseline_miles_per_stop) and baseline_miles_per_stop > 0 and miles_per_stop >= baseline_miles_per_stop * 1.15:
+        add(
+            "Inefficient miles-per-stop profile",
+            f"Miles-per-stop multiplier {_fmt_issue_value(miles_per_stop, 'num')} is above peer median {_fmt_issue_value(baseline_miles_per_stop, 'num')}.",
+            4,
+            "Consolidate stops, remove deadhead, and re-time routes to improve stop density.",
+        )
+
+    stop_count = row.get("median_stop_count_val_route_lvl", np.nan)
+    baseline_stop_count = baselines.get("median_stop_count_val_route_lvl", np.nan)
+    tote_count = row.get("median_tote_count_val_route_lvl", np.nan)
+    baseline_tote_count = baselines.get("median_tote_count_val_route_lvl", np.nan)
+    if pd.notna(stop_count) and pd.notna(baseline_stop_count) and baseline_stop_count > 0 and stop_count <= baseline_stop_count * 0.85:
+        add(
+            "Low stop density",
+            f"Median route stops {_fmt_issue_value(stop_count, 'num')} are below peer median {_fmt_issue_value(baseline_stop_count, 'num')}.",
+            4,
+            "Increase drop density, combine shipments, or shift volume into fuller routes where feasible.",
+        )
+    if pd.notna(tote_count) and pd.notna(baseline_tote_count) and baseline_tote_count > 0 and tote_count <= baseline_tote_count * 0.85:
+        add(
+            "Low tote density",
+            f"Median route totes {_fmt_issue_value(tote_count, 'num')} are below peer median {_fmt_issue_value(baseline_tote_count, 'num')}.",
+            3,
+            "Review consolidation rules, shipment packaging, and how loads are being split across stops.",
+        )
+
+    geo_multiplier = row.get("median_geography_multiplier", np.nan)
+    baseline_geo_multiplier = baselines.get("median_geography_multiplier", np.nan)
+    geo_mean = row.get("median_geo_mean", np.nan)
+    baseline_geo_mean = baselines.get("median_geo_mean", np.nan)
+    if pd.notna(geo_multiplier) and pd.notna(baseline_geo_multiplier) and baseline_geo_multiplier > 0 and geo_multiplier >= baseline_geo_multiplier * 1.10:
+        add(
+            "Geography / lane complexity",
+            f"Geography multiplier {_fmt_issue_value(geo_multiplier, 'num')} is above peer median {_fmt_issue_value(baseline_geo_multiplier, 'num')}.",
+            4,
+            "Reassess DC assignment, territory design, and whether a nearer xdock or alternate carrier mix would reduce travel burden.",
+        )
+    elif pd.notna(geo_mean) and pd.notna(baseline_geo_mean) and baseline_geo_mean > 0 and geo_mean >= baseline_geo_mean * 1.10:
+        add(
+            "Geography / density pressure",
+            f"Geo mean {_fmt_issue_value(geo_mean, 'num')} is above peer median {_fmt_issue_value(baseline_geo_mean, 'num')}.",
+            3,
+            "Check whether geography and density assumptions are structurally making this market expensive to serve.",
+        )
+
+    base_cost = row.get("median_lastmile_base_cost", np.nan)
+    fuel_cost = row.get("median_lastmile_fuel_cost", np.nan)
+    misc_cost = row.get("median_lastmile_misc_cost", np.nan)
+    total_cost = row.get("median_lastmile_total_cost", np.nan)
+    if pd.notna(total_cost) and total_cost > 0:
+        base_share = base_cost / total_cost if pd.notna(base_cost) else np.nan
+        fuel_share = fuel_cost / total_cost if pd.notna(fuel_cost) else np.nan
+        misc_share = misc_cost / total_cost if pd.notna(misc_cost) else np.nan
+        if pd.notna(base_share) and base_share >= 0.55:
+            add(
+                "Base cost pressure",
+                f"Base cost is {plain_pct(base_share)} of total cost.",
+                3,
+                "Review contract rate structure, fixed-fee components, and market-level pricing assumptions.",
+            )
+        if pd.notna(fuel_share) and fuel_share >= 0.25:
+            add(
+                "Fuel cost pressure",
+                f"Fuel cost is {plain_pct(fuel_share)} of total cost.",
+                3,
+                "Check fuel surcharge logic, route length, and whether distance-driven savings are available.",
+            )
+        if pd.notna(misc_share) and misc_share >= 0.15:
+            add(
+                "Miscellaneous cost pressure",
+                f"Misc cost is {plain_pct(misc_share)} of total cost.",
+                3,
+                "Audit accessorials, exception charges, and other non-core billable items.",
+            )
+
+    sensitivity = row.get("Combined Sensitivity", np.nan)
+    if pd.notna(sensitivity) and sensitivity > 0.40:
+        add(
+            "Benchmark sensitivity",
+            f"Combined sensitivity is {_fmt_issue_value(sensitivity, 'pct')}.",
+            3,
+            "Treat normalization and cleansheet outputs as directional only until the multiplier inputs are reviewed.",
+        )
+
+    if str(row.get("Business Note", "")) == "Model and cleansheet both point high":
+        add(
+            "Triangulated overpay signal",
+            "Model, normalized cost, and cleansheet are aligned.",
+            5,
+            "Prioritize this market for commercial review and sourcing action.",
+        )
+
+    if "underpay" in str(row.get("Signal / Classification", "")).lower():
+        add(
+            "Low-cost signal",
+            "The market is trading below expected cost.",
+            2,
+            "Validate that the low cost is real before treating it as a savings opportunity; underbilling can look like underpay.",
+        )
+
+    if not items and pd.notna(row.get("Actual CPS", np.nan)) and pd.notna(row.get("Expected CPS", np.nan)):
+        add(
+            "Residual overage",
+            f"Actual CPS {_fmt_issue_value(row.get('Actual CPS'), 'money')} versus expected CPS {_fmt_issue_value(row.get('Expected CPS'), 'money')}.",
+            1,
+            "Review the largest route exceptions, service pattern, and market-level operating assumptions.",
+        )
+
+    items.sort(key=lambda x: int(x["severity"]), reverse=True)
+    return items
+
+
+def root_cause_summary(row: pd.Series, baselines: dict[str, float]) -> str:
+    items = _root_cause_items(row, baselines)
+    if not items:
+        return "No strong root-cause signal detected."
+    top = items[0]
+    return f"{top['label']}: {top['detail']}"
+
+
+def recommendation_text(row: pd.Series, baselines: dict[str, float]) -> list[str]:
+    items = _root_cause_items(row, baselines)
+    labels = {item["label"] for item in items}
+    recs: list[str] = []
+
+    if {"Low evidence / thin volume", "High zero-cost exposure"} & labels:
+        recs.append("Start with invoice and data-quality validation before any pricing or network action.")
+    if {"Long route length", "Inefficient miles-per-stop profile", "Low stop density", "Low tote density"} & labels:
+        recs.append("Review route consolidation, stop density, dispatch sequencing, and whether the market should be rebalanced to a closer service point.")
+    if {"Geography / lane complexity", "Geography / density pressure"} & labels:
+        recs.append("Reassess DC assignment, lane design, and carrier mix for structural travel reduction opportunities.")
+    if {"Base cost pressure", "Fuel cost pressure", "Miscellaneous cost pressure"} & labels:
+        recs.append("Audit the pricing structure and billable charges, then renegotiate the highest-cost components.")
+    if "Benchmark sensitivity" in labels:
+        recs.append("Verify normalization inputs and cleansheet assumptions before making a final commercial call.")
+    if "Triangulated overpay signal" in labels:
+        recs.append("Prioritize this xdock for sourcing review because the model and benchmark layers agree.")
+    if not recs:
+        recs.append("Use the market-level exception summary to identify the largest route or billing drivers, then validate against the underlying shipment detail.")
+    if "underpay" in str(row.get("Signal / Classification", "")).lower():
+        recs.append("If the market is under expected cost, confirm there is no missing charge capture before treating it as savings.")
+    return recs
+
+
+def _impact_band(score: float) -> str:
+    if score >= 0.75:
+        return "High"
+    if score >= 0.50:
+        return "Medium"
+    return "Low"
+
+
+def ranked_recommendations(row: pd.Series, baselines: dict[str, float]) -> list[dict[str, str]]:
+    profile = str(baselines.get("recommender_profile", "Benchmark-heavy")).strip()
+    if profile not in {"Benchmark-heavy", "Balanced"}:
+        profile = "Benchmark-heavy"
+
+    actual = float(row.get("Actual CPS", np.nan)) if pd.notna(row.get("Actual CPS", np.nan)) else np.nan
+    expected = float(row.get("Expected CPS", np.nan)) if pd.notna(row.get("Expected CPS", np.nan)) else np.nan
+    normalized = float(row.get("Normalized Cost", np.nan)) if pd.notna(row.get("Normalized Cost", np.nan)) else np.nan
+    clean_aggr = float(row.get("Cleansheet Aggressive", np.nan)) if pd.notna(row.get("Cleansheet Aggressive", np.nan)) else np.nan
+
+    model_gap = max((actual / expected) - 1, 0.0) if pd.notna(actual) and pd.notna(expected) and expected > 0 else 0.0
+    norm_gap = max((actual / normalized) - 1, 0.0) if pd.notna(actual) and pd.notna(normalized) and normalized > 0 else 0.0
+    clean_gap = max((actual / clean_aggr) - 1, 0.0) if pd.notna(actual) and pd.notna(clean_aggr) and clean_aggr > 0 else 0.0
+
+    zero_rate = float(row.get("Zero Cost Rate", 0) or 0)
+    distance = float(row.get("median_distance_val", 0) or 0)
+    distance_base = float(baselines.get("median_distance_val", 0) or 0)
+    distance_excess = max((distance / distance_base) - 1, 0.0) if distance_base > 0 else 0.0
+
+    miles_mult = float(row.get("median_miles_per_stop_norm_multiplier_qt", 0) or 0)
+    miles_base = float(baselines.get("median_miles_per_stop_norm_multiplier_qt", 0) or 0)
+    miles_excess = max((miles_mult / miles_base) - 1, 0.0) if miles_base > 0 else 0.0
+
+    stop_count = float(row.get("median_stop_count_val_route_lvl", 0) or 0)
+    stop_base = float(baselines.get("median_stop_count_val_route_lvl", 0) or 0)
+    stop_deficit = max((stop_base / stop_count) - 1, 0.0) if stop_count > 0 and stop_base > 0 else 0.0
+
+    fuel_share = 0.0
+    base_share = 0.0
+    misc_share = 0.0
+    total_cost = row.get("median_lastmile_total_cost", np.nan)
+    if pd.notna(total_cost) and total_cost > 0:
+        fuel = float(row.get("median_lastmile_fuel_cost", 0) or 0)
+        base = float(row.get("median_lastmile_base_cost", 0) or 0)
+        misc = float(row.get("median_lastmile_misc_cost", 0) or 0)
+        fuel_share = max(fuel / total_cost, 0.0)
+        base_share = max(base / total_cost, 0.0)
+        misc_share = max(misc / total_cost, 0.0)
+
+    benchmark_alignment = min(1.0, (0.45 * clean_gap) + (0.35 * norm_gap) + (0.20 * model_gap))
+
+    if profile == "Balanced":
+        action_rows = [
+            {
+                "Action": "Renegotiate rate card / sourcing",
+                "Score": min(1.0, (0.35 * clean_gap) + (0.20 * norm_gap) + (0.35 * model_gap) + (0.10 * base_share)),
+                "Reason": "Model gap and benchmarks both support a pricing review opportunity.",
+            },
+            {
+                "Action": "Route consolidation and stop-density lift",
+                "Score": min(1.0, (0.25 * norm_gap) + (0.25 * miles_excess) + (0.25 * stop_deficit) + (0.25 * distance_excess)),
+                "Reason": "Operational route profile and normalized-cost pressure are both elevated.",
+            },
+            {
+                "Action": "Revisit fill DC / lane design",
+                "Score": min(1.0, (0.25 * clean_gap) + (0.25 * distance_excess) + (0.25 * miles_excess) + (0.25 * model_gap)),
+                "Reason": "Lane geometry and model residuals indicate structural design opportunity.",
+            },
+            {
+                "Action": "Fuel program and surcharge validation",
+                "Score": min(1.0, (0.35 * fuel_share) + (0.20 * clean_gap) + (0.20 * distance_excess) + (0.25 * model_gap)),
+                "Reason": "Fuel mix and expected-cost overage indicate surcharge and distance review.",
+            },
+            {
+                "Action": "Invoice and accessorial audit",
+                "Score": min(1.0, (0.45 * zero_rate) + (0.30 * misc_share) + (0.25 * model_gap)),
+                "Reason": "Billing leakage risk combines with model overage for audit priority.",
+            },
+        ]
+    else:
+        action_rows = [
+            {
+                "Action": "Renegotiate rate card / sourcing",
+                "Score": min(1.0, (0.50 * clean_gap) + (0.25 * norm_gap) + (0.15 * model_gap) + (0.10 * base_share)),
+                "Reason": "Cleansheet and normalized cost indicate market pricing above benchmark.",
+            },
+            {
+                "Action": "Route consolidation and stop-density lift",
+                "Score": min(1.0, (0.35 * norm_gap) + (0.30 * miles_excess) + (0.20 * stop_deficit) + (0.15 * distance_excess)),
+                "Reason": "Normalized-cost pressure plus route profile suggests network inefficiency.",
+            },
+            {
+                "Action": "Revisit fill DC / lane design",
+                "Score": min(1.0, (0.40 * clean_gap) + (0.25 * distance_excess) + (0.20 * miles_excess) + (0.15 * model_gap)),
+                "Reason": "Cleansheet and travel burden suggest structural lane and assignment redesign.",
+            },
+            {
+                "Action": "Fuel program and surcharge validation",
+                "Score": min(1.0, (0.40 * fuel_share) + (0.25 * clean_gap) + (0.20 * distance_excess) + (0.15 * model_gap)),
+                "Reason": "Fuel share and benchmark gaps indicate surcharge and route-length opportunity.",
+            },
+            {
+                "Action": "Invoice and accessorial audit",
+                "Score": min(1.0, (0.45 * zero_rate) + (0.35 * misc_share) + (0.20 * norm_gap)),
+                "Reason": "Zero-cost exposure or misc charges suggest billing-quality leakage.",
+            },
+        ]
+
+    for row_item in action_rows:
+        row_item["Impact"] = _impact_band(float(row_item["Score"]))
+        row_item["Confidence"] = _impact_band(float((0.6 * benchmark_alignment) + (0.4 * row_item["Score"])))
+
+    ranked = sorted(action_rows, key=lambda x: x["Score"], reverse=True)
+    return ranked
+
+
+def top_root_cause_label(row: pd.Series, baselines: dict[str, float]) -> str:
+    items = _root_cause_items(row, baselines)
+    return items[0]["label"] if items else "n/a"
+
+
+def top_recommendation(row: pd.Series, baselines: dict[str, float]) -> str:
+    ranked = ranked_recommendations(row, baselines)
+    return ranked[0]["Action"] if ranked else "n/a"
+
+
+def top_action_impact(row: pd.Series, baselines: dict[str, float]) -> str:
+    ranked = ranked_recommendations(row, baselines)
+    return ranked[0]["Impact"] if ranked else "n/a"
+
+
+def top_action_confidence(row: pd.Series, baselines: dict[str, float]) -> str:
+    ranked = ranked_recommendations(row, baselines)
+    return ranked[0]["Confidence"] if ranked else "n/a"
 
 # --------------------------------------------------------------------------- #
 # Styling
@@ -1010,11 +1350,17 @@ with st.sidebar:
     st.divider()
     st.header("Signal thresholds")
     min_group_n = st.number_input("Minimum paid rows", min_value=5, max_value=5000, value=30, step=5)
-    overpay_possible = st.slider("Possible overpay threshold", 0.05, 0.50, 0.10, 0.01)
-    overpay_strong = st.slider("Strong overpay threshold", 0.10, 1.00, 0.20, 0.01)
+    overpay_possible = st.slider("Overpay floor threshold", 0.05, 0.50, 0.10, 0.01)
+    overpay_strong = st.slider("Overpay high-confidence threshold", 0.10, 1.00, 0.20, 0.01)
     underpay_possible = -st.slider("Possible underpay threshold", 0.05, 0.50, 0.10, 0.01)
     underpay_strong = -st.slider("Strong underpay threshold", 0.10, 1.00, 0.20, 0.01)
     use_p25_p75 = st.toggle("Fit P25/P75 bands", value=False, help="Leave off for speed. P10/P50/P90 is enough for the decision tool.")
+    recommender_profile = st.selectbox(
+        "Recommendation profile",
+        ["Benchmark-heavy", "Balanced"],
+        index=0,
+        help="Benchmark-heavy prioritizes normalized cost and cleansheet; Balanced gives more weight to expected-CPS residual and route profile.",
+    )
 
 if filtered.empty:
     st.warning("No rows match the current filters.")
@@ -1039,8 +1385,7 @@ except Exception as exc:
 # KPI cards and automatic explanation
 # --------------------------------------------------------------------------- #
 counts = business_view["Signal / Classification"].value_counts()
-strong_over = int(counts.get("Strong overpay candidate", 0))
-possible_over = int(counts.get("Possible overpay", 0))
+overpay_count = int(counts.get("Overpay candidate", 0))
 underpay = int(counts.get("Strong underpay candidate", 0) + counts.get("Possible underpay", 0))
 not_enough = int(counts.get("Not enough evidence", 0))
 
@@ -1055,7 +1400,7 @@ else:
 
 cards = [
     ("Scored groups", f"{len(business_view):,}", f"grain: {'Market (XDOCK)' if 'explicit' not in grain else 'Market + Carrier'}"),
-    ("Overpay candidates", f"{strong_over + possible_over:,}", f"strong: {strong_over:,}"),
+    ("Overpay candidates", f"{overpay_count:,}", "single combined bucket"),
     ("Underpay signals", f"{underpay:,}", "validate missing charges"),
     ("Highest gap", pct(worst_gap), str(worst_label)[:32]),
     ("High confidence", f"{high_conf:,}", f"not enough evidence: {not_enough:,}"),
@@ -1066,9 +1411,24 @@ kpi_html = '<div class="kpi-row">' + "".join(
 ) + "</div>"
 st.markdown(kpi_html, unsafe_allow_html=True)
 
+rca_baselines = {
+    "min_group_n": int(min_group_n),
+    "recommender_profile": recommender_profile,
+}
+for col in [
+    "median_distance_val",
+    "median_miles_per_stop_norm_multiplier_qt",
+    "median_stop_count_val_route_lvl",
+    "median_tote_count_val_route_lvl",
+    "median_geography_multiplier",
+    "median_geo_mean",
+]:
+    if col in business_view.columns:
+        rca_baselines[col] = business_view[col].median(skipna=True)
+
 with st.expander("Quick interpretation", expanded=False):
     st.markdown(
-        f"- {strong_over + possible_over:,} overpay candidates, {underpay:,} underpay signals, and {not_enough:,} groups with not enough evidence."
+        f"- {overpay_count:,} overpay candidates, {underpay:,} underpay signals, and {not_enough:,} groups with not enough evidence."
     )
     st.markdown(
         "- Decision rule: use **Actual CPS vs Expected CPS** as the primary signal; use **normalized cost and cleansheet** as supporting evidence."
@@ -1108,6 +1468,55 @@ if market_options:
         ) + "</div>"
         st.markdown(mi_html, unsafe_allow_html=True)
         st.markdown('<div class="tool-note">' + "<br>".join(row_investigation_text(row)) + "</div>", unsafe_allow_html=True)
+
+        rca_items = _root_cause_items(row, rca_baselines)
+        ranked_actions = ranked_recommendations(row, rca_baselines)
+
+        st.markdown("### Root cause analyzer")
+        left, right = st.columns(2)
+        with left:
+            st.markdown(f"**Top root cause**\n\n{root_cause_summary(row, rca_baselines)}")
+            if rca_items:
+                st.markdown("**Contributing drivers**")
+                for item in rca_items[:5]:
+                    st.markdown(f"- {item['label']}: {item['detail']}")
+            else:
+                st.info("No strong driver pattern was detected for this market.")
+        with right:
+            st.markdown(f"**Recommended actions ({recommender_profile} profile)**")
+            for idx, action in enumerate(ranked_actions[:3], start=1):
+                st.markdown(
+                    f"{idx}. {action['Action']} ({action['Impact']} impact, {action['Confidence']} confidence)"
+                )
+                st.caption(action["Reason"])
+
+        st.caption("The analyzer is rules-based: it compares the selected xdock to peer medians in the current filtered view and turns the strongest deviations into action suggestions.")
+
+        overpay_queue = business_view[business_view["Signal / Classification"].eq("Overpay candidate")].copy()
+        if len(overpay_queue):
+            overpay_queue["Top Root Cause"] = overpay_queue.apply(lambda r: top_root_cause_label(r, rca_baselines), axis=1)
+            overpay_queue["Recommended Action"] = overpay_queue.apply(lambda r: top_recommendation(r, rca_baselines), axis=1)
+            overpay_queue["Action Impact"] = overpay_queue.apply(lambda r: top_action_impact(r, rca_baselines), axis=1)
+            overpay_queue["Action Confidence"] = overpay_queue.apply(lambda r: top_action_confidence(r, rca_baselines), axis=1)
+            st.markdown("### High-cost xdock queue")
+            queue_cols = existing_cols(
+                overpay_queue,
+                [
+                    "Market / Xdock",
+                    "Signal / Classification",
+                    "Confidence",
+                    "CPS Gap vs Expected %",
+                    "Actual CPS",
+                    "Expected CPS",
+                    "Records With CPS",
+                ],
+            )
+            queue_cols += [c for c in ["Top Root Cause", "Recommended Action", "Action Impact", "Action Confidence"] if c in overpay_queue.columns]
+            st.dataframe(
+                overpay_queue.sort_values(["CPS Gap vs Expected %", "Records With CPS"], ascending=[False, False])[queue_cols].head(20),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 # --------------------------------------------------------------------------- #
 # Business charts
@@ -1409,8 +1818,10 @@ Very Low confidence groups are treated as Not enough evidence in final classific
 
 Classification is assigned in priority order:
 
-#### Strong Overpay Candidate
-All three conditions must be met:
+#### Overpay Candidate (Combined Bucket)
+This bucket combines strong and possible overpay logic.
+
+Strong-overpay trigger:
 1. Gap % ≥ strong overpay threshold (default: +20%)
 2. Actual CPS > P90 Expected CPS (actual exceeds the model's upper predicted range)
 3. Confidence is High or Medium
@@ -1421,10 +1832,10 @@ All three conditions must be met:
 2. Actual CPS < P10 Expected CPS (actual is below the model's lower predicted range)
 3. Confidence is High or Medium
 
-#### Possible Overpay
+Possible-overpay trigger (also mapped into the same Overpay Candidate bucket):
 1. Gap % ≥ possible overpay threshold (default: +10%)
 2. (If P25/P75 enabled) Actual CPS > P75 Expected CPS
-3. Group not already classified as Strong Overpay
+3. Group not already classified by higher-priority rules
 
 #### Possible Underpay
 1. Gap % ≤ possible underpay threshold (default: -10%)
@@ -1503,7 +1914,7 @@ with tab01:
     )
 
     class_options = classification_counts["Signal / Classification"].tolist()
-    def_class = "Strong overpay candidate" if "Strong overpay candidate" in class_options else class_options[0]
+    def_class = "Overpay candidate" if "Overpay candidate" in class_options else class_options[0]
 
     selected_class = None
     selected_from_chart = False
@@ -1636,7 +2047,7 @@ with tab1:
         st.caption("Dots above the diagonal cost more than expected after controlling for market profile. Larger bubbles have more records with CPS.")
 
 with tab2:
-    top_overpay = business_view[business_view["Signal / Classification"].isin(["Strong overpay candidate", "Possible overpay"])].copy()
+    top_overpay = business_view[business_view["Signal / Classification"].eq("Overpay candidate")].copy()
     top_overpay = top_overpay.sort_values("CPS Gap vs Expected %", ascending=False).head(30)
     if len(top_overpay):
         top_overpay["Label"] = make_label(top_overpay)
