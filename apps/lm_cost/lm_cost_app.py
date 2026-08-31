@@ -159,6 +159,18 @@ def numeric_coerce(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
+
+def selected_rows_from_event(event) -> list[int]:
+    if event is None:
+        return []
+    if isinstance(event, dict):
+        return list(event.get("selection", {}).get("rows", []) or [])
+    selection = getattr(event, "selection", None)
+    if selection is None:
+        return []
+    rows = getattr(selection, "rows", None)
+    return list(rows) if rows is not None else []
+
 # --------------------------------------------------------------------------- #
 # Loading and preparation
 # --------------------------------------------------------------------------- #
@@ -1954,11 +1966,72 @@ with tab11:
                 "Action 2 Confidence",
             ],
         )
-        st.dataframe(
-            overpay_queue.sort_values(["CPS Gap vs Expected %", "Records With CPS"], ascending=[False, False])[queue_cols].head(40),
-            use_container_width=True,
-            hide_index=True,
-        )
+        overpay_queue = overpay_queue.sort_values(["CPS Gap vs Expected %", "Records With CPS"], ascending=[False, False])
+        overpay_show = overpay_queue[queue_cols].head(40)
+
+        selected_from_overpay_queue = None
+        try:
+            overpay_event = st.dataframe(
+                overpay_show,
+                use_container_width=True,
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="overpay_queue_table",
+            )
+            selected_rows = selected_rows_from_event(overpay_event)
+            if selected_rows:
+                selected_from_overpay_queue = overpay_show.iloc[selected_rows[0]]["Market / Xdock"]
+        except TypeError:
+            st.dataframe(
+                overpay_show,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        overpay_market_options = overpay_queue["Market / Xdock"].astype(str).tolist()
+        if overpay_market_options:
+            if "overpay_picker" not in st.session_state:
+                st.session_state["overpay_picker"] = overpay_market_options[0]
+            if st.session_state.get("overpay_picker") not in overpay_market_options:
+                st.session_state["overpay_picker"] = overpay_market_options[0]
+            if selected_from_overpay_queue and selected_from_overpay_queue in overpay_market_options:
+                st.session_state["overpay_picker"] = selected_from_overpay_queue
+
+            selected_overpay_market = st.selectbox(
+                "Drilldown market from overpay queue",
+                overpay_market_options,
+                key="overpay_picker",
+            )
+
+            overpay_row_df = overpay_queue[
+                overpay_queue["Market / Xdock"].astype(str).eq(selected_overpay_market)
+            ]
+            if not overpay_row_df.empty:
+                overpay_row = overpay_row_df.iloc[0]
+                overpay_ranked = ranked_recommendations(overpay_row, rca_baselines)
+
+                st.markdown("#### Overpay queue drilldown")
+                st.markdown(
+                    f"- Actual CPS: {money(overpay_row.get('Actual CPS'))}"
+                    f" | Expected CPS: {money(overpay_row.get('Expected CPS'))}"
+                    f" | Gap: {pct(overpay_row.get('CPS Gap vs Expected %'))}"
+                )
+                st.markdown(
+                    f"- Normalized Cost: {money(overpay_row.get('Normalized Cost'))}"
+                    f" | Cleansheet Aggressive: {money(overpay_row.get('Cleansheet Aggressive'))}"
+                    f" | Records With CPS: {int(overpay_row.get('Records With CPS', 0)):,}"
+                )
+                st.markdown(f"- Top root cause: {root_cause_summary(overpay_row, rca_baselines)}")
+
+                if overpay_ranked:
+                    rec1 = overpay_ranked[0]
+                    st.markdown(f"1. {rec1['Action']} ({rec1['Impact']} impact, {rec1['Confidence']} confidence)")
+                    st.caption(rec1["Reason"])
+                if len(overpay_ranked) > 1:
+                    rec2 = overpay_ranked[1]
+                    st.markdown(f"2. {rec2['Action']} ({rec2['Impact']} impact, {rec2['Confidence']} confidence)")
+                    st.caption(rec2["Reason"])
     else:
         st.info("No overpay candidates with the current filters.")
 
@@ -2019,7 +2092,7 @@ with tab11:
                 selection_mode="single-row",
                 key="strict_overpay_queue_table",
             )
-            selected_rows = queue_event.get("selection", {}).get("rows", []) if isinstance(queue_event, dict) else []
+            selected_rows = selected_rows_from_event(queue_event)
             if selected_rows:
                 selected_from_queue = strict_overpay_queue.iloc[selected_rows[0]]["Market / Xdock"]
         except TypeError:
@@ -2030,9 +2103,6 @@ with tab11:
             )
 
         strict_market_options = strict_overpay_queue["Market / Xdock"].astype(str).tolist()
-        if selected_from_queue and selected_from_queue in market_options:
-            st.session_state["market_picker"] = selected_from_queue
-
         if strict_market_options:
             if "strict_overpay_picker" not in st.session_state:
                 st.session_state["strict_overpay_picker"] = strict_market_options[0]
@@ -2046,8 +2116,6 @@ with tab11:
                 strict_market_options,
                 key="strict_overpay_picker",
             )
-            if selected_strict_market in market_options:
-                st.session_state["market_picker"] = selected_strict_market
 
             strict_row_df = strict_overpay_queue[
                 strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_strict_market)
@@ -2055,7 +2123,20 @@ with tab11:
             if not strict_row_df.empty:
                 strict_row = strict_row_df.iloc[0]
                 strict_ranked = ranked_recommendations(strict_row, rca_baselines)
-                st.markdown("#### Strict queue drilldown recommendations")
+
+                st.markdown("#### Strict queue drilldown")
+                st.markdown(
+                    f"- Actual CPS: {money(strict_row.get('Actual CPS'))}"
+                    f" | Expected CPS: {money(strict_row.get('Expected CPS'))}"
+                    f" | Gap: {pct(strict_row.get('CPS Gap vs Expected %'))}"
+                )
+                st.markdown(
+                    f"- Normalized Cost: {money(strict_row.get('Normalized Cost'))}"
+                    f" | Cleansheet Aggressive: {money(strict_row.get('Cleansheet Aggressive'))}"
+                    f" | Records With CPS: {int(strict_row.get('Records With CPS', 0)):,}"
+                )
+                st.markdown(f"- Top root cause: {root_cause_summary(strict_row, rca_baselines)}")
+
                 if strict_ranked:
                     rec1 = strict_ranked[0]
                     st.markdown(f"1. {rec1['Action']} ({rec1['Impact']} impact, {rec1['Confidence']} confidence)")
@@ -2064,7 +2145,6 @@ with tab11:
                     rec2 = strict_ranked[1]
                     st.markdown(f"2. {rec2['Action']} ({rec2['Impact']} impact, {rec2['Confidence']} confidence)")
                     st.caption(rec2["Reason"])
-                st.caption("Selecting a market here also updates the main market-investigation picker above.")
     else:
         st.info("No xdock meets the strict all-3-above condition with the current filters.")
 
