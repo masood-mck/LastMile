@@ -49,6 +49,9 @@ st.set_page_config(page_title="Last Mile Cost Intelligence (LMCI)", layout="wide
 # --------------------------------------------------------------------------- #
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 LOCAL_CSV_PATH = os.path.join(_DATA_DIR, "LM_CS_slim.csv.gz")
+LOCAL_PREPARED_PICKLE_PATH = os.path.join(_DATA_DIR, "LM_CS_slim_prepared.pkl")
+LOCAL_PREPARED_PARQUET_PATH = os.path.join(_DATA_DIR, "LM_CS_slim_prepared.parquet")
+LOCAL_SCORECARD_ARTIFACT_PATH = os.path.join(_DATA_DIR, "LM_CS_scorecard_default.pkl")
 DATABRICKS_TABLE = os.environ.get("NORM_DATA_TABLE", "")
 DATABRICKS_PATH = os.environ.get("NORM_DATA_PATH", "")
 
@@ -196,6 +199,19 @@ def _load_via_spark() -> pd.DataFrame | None:
 
 @st.cache_data(show_spinner="Loading cost data...")
 def load_data() -> pd.DataFrame:
+    prepared_path = os.environ.get("NORM_PREPARED_PATH", "").strip()
+    if prepared_path:
+        if prepared_path.lower().endswith(".pkl") and os.path.exists(prepared_path):
+            return pd.read_pickle(prepared_path)
+        if prepared_path.lower().endswith(".parquet") and os.path.exists(prepared_path):
+            return pd.read_parquet(prepared_path)
+
+    for local_prepared in [LOCAL_PREPARED_PICKLE_PATH, LOCAL_PREPARED_PARQUET_PATH]:
+        if os.path.exists(local_prepared):
+            if local_prepared.lower().endswith(".pkl"):
+                return pd.read_pickle(local_prepared)
+            return pd.read_parquet(local_prepared)
+
     df: pd.DataFrame | None = None
     if _on_databricks():
         df = _load_via_spark()
@@ -283,6 +299,55 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     df["MARKET"] = df["XDOCK"].map(market_name)
     df["paid_flag"] = df[TARGET].fillna(0) > 0
     return df
+
+
+def _is_default_scorecard_request(
+    *,
+    use_period_filter: bool,
+    dc_options: list[str],
+    sel_dcs: list[str],
+    cust_type_options: list[str],
+    sel_cust_types: list[str],
+    min_group_n: int,
+    overpay_strong: float,
+    overpay_possible: float,
+    underpay_strong: float,
+    underpay_possible: float,
+    use_p25_p75: bool,
+) -> bool:
+    full_scope = (not use_period_filter) and (set(sel_dcs) == set(dc_options)) and (
+        set(sel_cust_types) == set(cust_type_options)
+    )
+    default_thresholds = (
+        int(min_group_n) == 30
+        and abs(float(overpay_possible) - 0.10) < 1e-9
+        and abs(float(overpay_strong) - 0.20) < 1e-9
+        and abs(float(underpay_possible) - (-0.10)) < 1e-9
+        and abs(float(underpay_strong) - (-0.20)) < 1e-9
+        and (not bool(use_p25_p75))
+    )
+    return full_scope and default_thresholds
+
+
+@st.cache_data(show_spinner=False)
+def load_precomputed_scorecard() -> tuple[pd.DataFrame, pd.DataFrame, dict] | None:
+    env_path = os.environ.get("NORM_SCORECARD_PATH", "").strip()
+    candidates = [env_path, LOCAL_SCORECARD_ARTIFACT_PATH] if env_path else [LOCAL_SCORECARD_ARTIFACT_PATH]
+    for path in candidates:
+        if not path or (not os.path.exists(path)):
+            continue
+        try:
+            payload = pd.read_pickle(path)
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        scorecard = payload.get("scorecard")
+        business_view = payload.get("business_view")
+        model_metrics = payload.get("model_metrics")
+        if isinstance(scorecard, pd.DataFrame) and isinstance(business_view, pd.DataFrame) and isinstance(model_metrics, dict):
+            return scorecard, business_view, model_metrics
+    return None
 
 # --------------------------------------------------------------------------- #
 # Modeling / scorecard engine
@@ -1173,6 +1238,7 @@ def render_recommendation_detail_body(row: pd.Series, baselines: dict[str, float
     if ranked:
         display_rows = []
         for idx, action in enumerate(ranked[:5], start=1):
+            ml_prob = action.get("ML Probability", np.nan)
             display_rows.append(
                 {
                     "Rank": idx,
@@ -1180,7 +1246,7 @@ def render_recommendation_detail_body(row: pd.Series, baselines: dict[str, float
                     "Impact": action.get("Impact", "n/a"),
                     "Confidence": action.get("Confidence", "n/a"),
                     "Hybrid Score": float(action.get("Score", np.nan)) if pd.notna(action.get("Score", np.nan)) else np.nan,
-                    "ML Probability": float(action.get("ML Probability", np.nan)) if pd.notna(action.get("ML Probability", np.nan)) else np.nan,
+                    "ML Probability": (100.0 * float(ml_prob)) if pd.notna(ml_prob) else np.nan,
                     "Reason": action.get("Reason", ""),
                 }
             )
@@ -1603,6 +1669,9 @@ except Exception as exc:
     st.error(f"Could not load data: {exc}")
     st.stop()
 
+all_dc_options = sorted(data["FILL_DC_CD"].dropna().astype(str).unique()) if "FILL_DC_CD" in data.columns else []
+all_cust_type_options = sorted(data["CUST_BUS_TYP_DSCR"].dropna().astype(str).unique()) if "CUST_BUS_TYP_DSCR" in data.columns else []
+
 # --------------------------------------------------------------------------- #
 # Sidebar controls
 # --------------------------------------------------------------------------- #
@@ -1627,6 +1696,7 @@ with st.sidebar:
     if sel_dcs:
         filtered = filtered[filtered["FILL_DC_CD"].astype(str).isin(sel_dcs)].copy()
 
+    sel_cust_types: list[str] = all_cust_type_options.copy()
     if "CUST_BUS_TYP_DSCR" in filtered.columns:
         cust_type_options = sorted(filtered["CUST_BUS_TYP_DSCR"].dropna().astype(str).unique())
         sel_cust_types = st.multiselect("Customer type filter", cust_type_options, default=cust_type_options)
@@ -1654,20 +1724,43 @@ if filtered.empty:
     st.warning("No rows match the current filters.")
     st.stop()
 
-try:
-    scorecard, business_view, model_metrics = build_scorecard(
-        filtered,
-        group_cols=group_cols,
-        min_group_n=int(min_group_n),
-        overpay_strong=float(overpay_strong),
-        overpay_possible=float(overpay_possible),
-        underpay_strong=float(underpay_strong),
-        underpay_possible=float(underpay_possible),
-        use_p25_p75=bool(use_p25_p75),
-    )
-except Exception as exc:
-    st.error(f"Could not build scorecard: {exc}")
-    st.stop()
+use_precomputed_default = _is_default_scorecard_request(
+    use_period_filter=bool(use_period_filter),
+    dc_options=all_dc_options,
+    sel_dcs=list(sel_dcs),
+    cust_type_options=all_cust_type_options,
+    sel_cust_types=list(sel_cust_types),
+    min_group_n=int(min_group_n),
+    overpay_strong=float(overpay_strong),
+    overpay_possible=float(overpay_possible),
+    underpay_strong=float(underpay_strong),
+    underpay_possible=float(underpay_possible),
+    use_p25_p75=bool(use_p25_p75),
+)
+
+scorecard = None
+business_view = None
+model_metrics = None
+if use_precomputed_default:
+    precomputed = load_precomputed_scorecard()
+    if precomputed is not None:
+        scorecard, business_view, model_metrics = precomputed
+
+if scorecard is None or business_view is None or model_metrics is None:
+    try:
+        scorecard, business_view, model_metrics = build_scorecard(
+            filtered,
+            group_cols=group_cols,
+            min_group_n=int(min_group_n),
+            overpay_strong=float(overpay_strong),
+            overpay_possible=float(overpay_possible),
+            underpay_strong=float(underpay_strong),
+            underpay_possible=float(underpay_possible),
+            use_p25_p75=bool(use_p25_p75),
+        )
+    except Exception as exc:
+        st.error(f"Could not build scorecard: {exc}")
+        st.stop()
 
 # --------------------------------------------------------------------------- #
 # KPI cards and automatic explanation
@@ -1728,10 +1821,10 @@ with st.expander("Quick interpretation", expanded=False):
 # --------------------------------------------------------------------------- #
 # Market investigation tool
 # --------------------------------------------------------------------------- #
-top_market_tab, top_reco_tab = st.tabs(["Market investigation", "Recommendation agent"])
+top_market_tab, top_reco_tab, top_business_tab = st.tabs(["Market investigation", "Recommendation agent", "Business views"])
 
 with top_market_tab:
-    st.subheader("1. Market investigation")
+    st.subheader("Market investigation")
     market_options = business_view["Market / Xdock"].astype(str).tolist()
     if market_options:
         if "market_picker" not in st.session_state:
@@ -1768,29 +1861,30 @@ with top_market_tab:
             st.markdown(mi_html, unsafe_allow_html=True)
             st.markdown('<div class="tool-note">' + "<br>".join(row_investigation_text(row)) + "</div>", unsafe_allow_html=True)
 
-            st.caption("Use the Recommender agent tab for ranked overpay queues, strict all-3-above filtering, and action drilldown.")
+            st.caption("Use the Recommender agent tab for ranked overpay queues, strict all-3-reference-cost filtering, and action drilldown.")
 
 # --------------------------------------------------------------------------- #
 # Business charts
 # --------------------------------------------------------------------------- #
-st.subheader("2. Business views")
-tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab10 = st.tabs(
-    [
-        "Method Flow",
-        "Methodology",
-        "Signal summary",
-        "Cleansheet triangulation",
-        "Signal Buckets",
-        "Actual vs expected",
-        "Top overpay",
-        "Cost band",
-        "Cost Comparison",
-        "Triangulation V1",
-        "Triangulation V2",
-        "Triangulation V3",
-        "Customer Layer",
-    ]
-)
+with top_business_tab:
+    st.subheader("Business views")
+    tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab10 = st.tabs(
+        [
+            "Method Flow",
+            "Methodology",
+            "Signal summary",
+            "Cleansheet triangulation",
+            "Signal Buckets",
+            "Actual vs expected",
+            "Top overpay",
+            "Cost band",
+            "Cost Comparison",
+            "Triangulation V1",
+            "Triangulation V2",
+            "Triangulation V3",
+            "Customer Layer",
+        ]
+    )
 
 hover_cols = existing_cols(
     business_view,
@@ -2182,15 +2276,6 @@ The recommender agent is a hybrid layer that ranks actions after the market is c
 
 with top_reco_tab:
     st.subheader("Recommender agent")
-    st.caption("Action queues for overpay markets, plus drilldown recommendations.")
-    st.caption("Expected CPS is generated by an ML model; recommendation ranking blends an ML action-probability model with rules-based agent scoring.")
-
-    if RECOMMENDER_MODEL_PACK.get("status") == "hybrid model":
-        st.success("Hybrid recommender active: ML action ranking is blended with agent rules.")
-    else:
-        st.info("Hybrid recommender fallback: rules-based agent only because the current filtered view is too small or too sparse for ML training.")
-
-    st.dataframe(pd.DataFrame([RECOMMENDER_MODEL_PACK.get("metrics", {})]), use_container_width=True, hide_index=True)
 
     overpay_queue = business_view[business_view["Signal / Classification"].eq("Overpay candidate")].copy()
     if len(overpay_queue):
@@ -2291,9 +2376,9 @@ with top_reco_tab:
         & (business_view["Actual CPS"] > business_view["Cleansheet Aggressive"])
     ].copy()
 
-    st.markdown("### Strict overpay queue (all 3 above benchmark)")
+    st.markdown("### Strict overpay queue (actual above all 3 reference costs)")
     st.caption(
-        "Rules: Overpay candidate and Actual CPS > Expected CPS, Actual CPS > Normalized Cost, and Actual CPS > Cleansheet Aggressive."
+        "Rules: Overpay candidate and Actual CPS > Expected CPS (model reference), Actual CPS > Normalized Cost (peer-normalized reference), and Actual CPS > Cleansheet Aggressive (cleansheet reference)."
     )
     if len(strict_overpay_queue):
         strict_overpay_queue["Top Root Cause"] = strict_overpay_queue.apply(lambda r: top_root_cause_label(r, rca_baselines), axis=1)
@@ -2381,7 +2466,7 @@ with top_reco_tab:
             if not strict_row_df.empty:
                 st.caption("Select a row to open popup details, or use the button to open the selected market.")
     else:
-        st.info("No xdock meets the strict all-3-above condition with the current filters.")
+        st.info("No xdock meets the strict all-3-reference-cost condition with the current filters.")
 
 with tab01:
     st.subheader("1. Signal summary and drilldown")

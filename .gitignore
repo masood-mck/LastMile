@@ -1,3 +1,10 @@
 # Python cache artifacts
 __pycache__/
 *.py[cod]
+
+# LM cost generated preprocessing artifacts
+apps/lm_cost/data/LM_CS_slim_prepared.pkl
+apps/lm_cost/data/LM_CS_slim_prepared.parquet
+apps/lm_cost/data/LM_CS_slim_preprocess_manifest.json
+apps/lm_cost/data/LM_CS_scorecard_default.pkl
+apps/lm_cost/data/LM_CS_scorecard_default_manifest.json
