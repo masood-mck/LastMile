@@ -1366,19 +1366,22 @@ def train_recommendation_agent(df: pd.DataFrame, baselines: dict[str, float], ra
         stratify=stratify,
     )
 
+    lr_common_kwargs = {
+        "max_iter": 2000,
+        "class_weight": "balanced",
+        "random_state": random_state,
+    }
+    try:
+        lr_model = LogisticRegression(multi_class="multinomial", **lr_common_kwargs)
+    except TypeError:
+        # Some sklearn builds do not accept multi_class; rely on estimator defaults.
+        lr_model = LogisticRegression(**lr_common_kwargs)
+
     pipe = Pipeline(
         [
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            (
-                "model",
-                LogisticRegression(
-                    max_iter=2000,
-                    class_weight="balanced",
-                    multi_class="multinomial",
-                    random_state=random_state,
-                ),
-            ),
+            ("model", lr_model),
         ]
     )
     pipe.fit(X_train, y_train)
