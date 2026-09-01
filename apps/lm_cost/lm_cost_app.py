@@ -282,7 +282,6 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     df = df[df["XDOCK"].notna()].copy()
     df["MARKET"] = df["XDOCK"].map(market_name)
     df["paid_flag"] = df[TARGET].fillna(0) > 0
-    df["zero_cost_flag"] = df[TARGET].fillna(0) <= 0
     return df
 
 # --------------------------------------------------------------------------- #
@@ -326,21 +325,21 @@ def build_scorecard(
             "Cleansheet Cost Per Stop Aggressive",
         ],
     )
-    keep = list(dict.fromkeys(group_cols + ["XDOCK", "MARKET", "FILL_DC_CD", "ROUTE_ID", TARGET, "paid_flag", "zero_cost_flag"] + metric_cols))
+    keep = list(dict.fromkeys(group_cols + ["XDOCK", "MARKET", "FILL_DC_CD", "ROUTE_ID", TARGET, "paid_flag"] + metric_cols))
     work = df[existing_cols(df, keep)].copy()
 
     # Reduce memory pressure.
     for c in group_cols:
         if c in work.columns:
             work[c] = work[c].astype("category")
-    for c in ["paid_flag", "zero_cost_flag"]:
+    for c in ["paid_flag"]:
         work[c] = work[c].astype("int8")
     for c in existing_cols(work, [TARGET] + metric_cols):
         work[c] = pd.to_numeric(work[c], errors="coerce").astype("float32")
 
     counts = (
         work.groupby(group_cols, dropna=False, observed=True)
-        .agg(records=(TARGET, "size"), paid_records=("paid_flag", "sum"), zero_records=("zero_cost_flag", "sum"))
+        .agg(records=(TARGET, "size"), paid_records=("paid_flag", "sum"))
         .reset_index()
     )
 
@@ -373,7 +372,6 @@ def build_scorecard(
     paid_agg = paid_for_agg.groupby(group_cols, dropna=False, observed=True).agg(**agg_dict).reset_index()
     market = counts.merge(paid_agg, on=group_cols, how="left")
 
-    market["zero_rate"] = safe_div(market["zero_records"], market["records"])
     market["paid_rate"] = safe_div(market["paid_records"], market["records"])
     for c in group_cols:
         market[c] = market[c].astype(str)
@@ -390,7 +388,6 @@ def build_scorecard(
         [
             "paid_records",
             "records",
-            "zero_rate",
             "paid_rate",
             "median_geography_multiplier",
             "median_shipment_norm_multiplier_qt",
@@ -539,10 +536,9 @@ def build_scorecard(
     market["confidence_score"] = 0
     market.loc[market["paid_records"] >= min_group_n, "confidence_score"] += 1
     market.loc[market["paid_records"] >= min_group_n * 3, "confidence_score"] += 1
-    market.loc[market["zero_rate"] <= 0.35, "confidence_score"] += 1
     market.loc[market["combined_sensitivity_abs_pct"].fillna(0) <= 0.40, "confidence_score"] += 1
     market["confidence"] = np.select(
-        [market["confidence_score"] >= 4, market["confidence_score"] == 3, market["confidence_score"] == 2],
+        [market["confidence_score"] >= 3, market["confidence_score"] == 2, market["confidence_score"] == 1],
         ["High", "Medium", "Low"],
         default="Very Low",
     )
@@ -611,7 +607,6 @@ def build_scorecard(
     def _conf_reason(row):
         parts = []
         paid = row.get("paid_records", 0) or 0
-        zero_rate = row.get("zero_rate", None)
         sens = row.get("combined_sensitivity_abs_pct", None)
         if paid >= min_group_n * 3:
             parts.append(f"high volume ({int(paid)} records)")
@@ -619,11 +614,6 @@ def build_scorecard(
             parts.append(f"adequate volume ({int(paid)} records)")
         else:
             parts.append(f"low volume ({int(paid)} records)")
-        if zero_rate is not None:
-            if zero_rate <= 0.35:
-                parts.append(f"low zero-cost rate ({zero_rate:.0%})")
-            else:
-                parts.append(f"high zero-cost rate ({zero_rate:.0%})")
         if sens is not None:
             if sens <= 0.40:
                 parts.append(f"stable sensitivity ({sens:.0%})")
@@ -644,7 +634,7 @@ def build_scorecard(
         [
             "Model and cleansheet both point high",
             "Model and cleansheet both point low",
-            "Low volume, high zero rate, or weak basis",
+            "Low volume or weak basis",
             "Sensitive to normalization and cleansheet assumptions",
         ],
         default="Model-based residual signal",
@@ -669,7 +659,6 @@ def build_scorecard(
     market["Confidence Reason"] = market["Confidence Reason"]
     market["Records With CPS"] = market["paid_records"]
     market["Total Records"] = market["records"]
-    market["Zero Cost Rate"] = market["zero_rate"]
     market["Gap vs Conservative Cleansheet %"] = market["cleansheet_cons_gap_pct"]
     market["Gap vs Aggressive Cleansheet %"] = market["cleansheet_aggr_gap_pct"]
     market["Normalization Sensitivity"] = market["norm_sensitivity_abs_pct"]
@@ -688,7 +677,6 @@ def build_scorecard(
             "Business Note",
             "Total Records",
             "Records With CPS",
-            "Zero Cost Rate",
             "Actual CPS",
             "Expected CPS",
             "Expected Low CPS P10",
@@ -731,7 +719,7 @@ def classification_summary_text(business_view: pd.DataFrame, metrics: dict) -> l
     if strong_under + poss_under > 0:
         out.append(f"It also found {strong_under + poss_under:,} underpay signals. Treat underpay as a validation queue, not an immediate savings opportunity, because low cost can also indicate missing charges or incomplete invoices.")
     if not_enough > 0:
-        out.append(f"{not_enough:,} groups are marked as not enough evidence because of low volume, weak confidence, missing expected CPS, or high zero-cost exposure.")
+        out.append(f"{not_enough:,} groups are marked as not enough evidence because of low volume, weak confidence, or missing expected CPS.")
     if metrics.get("model_status") == "fallback benchmark":
         out.append("The model fell back to a benchmark method because there were not enough market groups or features to train a stable expected-cost model.")
     else:
@@ -812,15 +800,6 @@ def _root_cause_items(row: pd.Series, baselines: dict[str, float]) -> list[dict[
             f"{_fmt_issue_value(records_with_cps, 'int')} paid rows vs minimum {min_group_n:,}.",
             5,
             "Validate invoices, missing cost capture, and data completeness before commercial action.",
-        )
-
-    zero_cost_rate = row.get("Zero Cost Rate", np.nan)
-    if pd.notna(zero_cost_rate) and zero_cost_rate > 0.35:
-        add(
-            "High zero-cost exposure",
-            f"Zero-cost rate is {_fmt_issue_value(zero_cost_rate, 'pct')}.",
-            5,
-            "Check missing invoices, suppressed charges, and whether the row is under-billed or incomplete.",
         )
 
     distance = row.get("median_distance_val", np.nan)
@@ -961,12 +940,12 @@ def recommendation_text(row: pd.Series, baselines: dict[str, float]) -> list[str
     labels = {item["label"] for item in items}
     recs: list[str] = []
 
-    if {"Low evidence / thin volume", "High zero-cost exposure"} & labels:
+    if {"Low evidence / thin volume"} & labels:
         recs.append("Start with invoice and data-quality validation before any pricing or network action.")
     if {"Long route length", "Inefficient miles-per-stop profile", "Low stop density", "Low tote density"} & labels:
         recs.append("Review route consolidation, stop density, dispatch sequencing, and whether the market should be rebalanced to a closer service point.")
     if {"Geography / lane complexity", "Geography / density pressure"} & labels:
-        recs.append("Reassess DC assignment, lane design, and carrier mix for structural travel reduction opportunities.")
+        recs.append("Reassess fill DC allocation and service-point assignment for structural travel reduction opportunities.")
     if {"Base cost pressure", "Fuel cost pressure", "Miscellaneous cost pressure"} & labels:
         recs.append("Audit the pricing structure and billable charges, then renegotiate the highest-cost components.")
     if "Benchmark sensitivity" in labels:
@@ -1002,9 +981,13 @@ def ranked_recommendations(row: pd.Series, baselines: dict[str, float], use_hybr
     norm_gap = max((actual / normalized) - 1, 0.0) if pd.notna(actual) and pd.notna(normalized) and normalized > 0 else 0.0
     clean_gap = max((actual / clean_aggr) - 1, 0.0) if pd.notna(actual) and pd.notna(clean_aggr) and clean_aggr > 0 else 0.0
 
+    normalized_ship = float(row.get("median_normalized_cost_shipment", np.nan)) if pd.notna(row.get("median_normalized_cost_shipment", np.nan)) else np.nan
+    normalized_density = float(row.get("median_normalized_cost_density", np.nan)) if pd.notna(row.get("median_normalized_cost_density", np.nan)) else np.nan
+    ship_norm_gap = max((actual / normalized_ship) - 1, 0.0) if pd.notna(actual) and pd.notna(normalized_ship) and normalized_ship > 0 else 0.0
+    density_norm_gap = max((actual / normalized_density) - 1, 0.0) if pd.notna(actual) and pd.notna(normalized_density) and normalized_density > 0 else 0.0
+
     action_probabilities = recommendation_action_probabilities(row) if use_hybrid else {}
 
-    zero_rate = float(row.get("Zero Cost Rate", 0) or 0)
     distance = float(row.get("median_distance_val", 0) or 0)
     distance_base = float(baselines.get("median_distance_val", 0) or 0)
     distance_excess = max((distance / distance_base) - 1, 0.0) if distance_base > 0 else 0.0
@@ -1012,6 +995,14 @@ def ranked_recommendations(row: pd.Series, baselines: dict[str, float], use_hybr
     miles_mult = float(row.get("median_miles_per_stop_norm_multiplier_qt", 0) or 0)
     miles_base = float(baselines.get("median_miles_per_stop_norm_multiplier_qt", 0) or 0)
     miles_excess = max((miles_mult / miles_base) - 1, 0.0) if miles_base > 0 else 0.0
+
+    shipment_mult = float(row.get("median_shipment_norm_multiplier_qt", 0) or 0)
+    shipment_base = float(baselines.get("median_shipment_norm_multiplier_qt", 0) or 0)
+    shipment_excess = max((shipment_mult / shipment_base) - 1, 0.0) if shipment_base > 0 else 0.0
+
+    geo_mult = float(row.get("median_geography_multiplier", 0) or 0)
+    geo_base = float(baselines.get("median_geography_multiplier", 0) or 0)
+    geo_excess = max((geo_mult / geo_base) - 1, 0.0) if geo_base > 0 else 0.0
 
     stop_count = float(row.get("median_stop_count_val_route_lvl", 0) or 0)
     stop_base = float(baselines.get("median_stop_count_val_route_lvl", 0) or 0)
@@ -1040,23 +1031,23 @@ def ranked_recommendations(row: pd.Series, baselines: dict[str, float], use_hybr
             },
             {
                 "Action": "Route consolidation and stop-density lift",
-                "Score": min(1.0, (0.25 * norm_gap) + (0.25 * miles_excess) + (0.25 * stop_deficit) + (0.25 * distance_excess)),
+                "Score": min(1.0, (0.20 * norm_gap) + (0.25 * miles_excess) + (0.20 * density_norm_gap) + (0.20 * stop_deficit) + (0.15 * distance_excess)),
                 "Reason": "Operational route profile and normalized-cost pressure are both elevated.",
             },
             {
-                "Action": "Revisit fill DC / lane design",
-                "Score": min(1.0, (0.25 * clean_gap) + (0.25 * distance_excess) + (0.25 * miles_excess) + (0.25 * model_gap)),
-                "Reason": "Lane geometry and model residuals indicate structural design opportunity.",
+                "Action": "Optimize fill DC allocation",
+                "Score": min(1.0, (0.20 * clean_gap) + (0.20 * distance_excess) + (0.20 * miles_excess) + (0.20 * geo_excess) + (0.20 * model_gap)),
+                "Reason": "DC allocation and model residuals indicate structural fulfillment-assignment opportunity.",
             },
             {
                 "Action": "Fuel program and surcharge validation",
-                "Score": min(1.0, (0.35 * fuel_share) + (0.20 * clean_gap) + (0.20 * distance_excess) + (0.25 * model_gap)),
+                "Score": min(1.0, (0.35 * fuel_share) + (0.20 * clean_gap) + (0.20 * distance_excess) + (0.10 * geo_excess) + (0.15 * model_gap)),
                 "Reason": "Fuel mix and expected-cost overage indicate surcharge and distance review.",
             },
             {
                 "Action": "Invoice and accessorial audit",
-                "Score": min(1.0, (0.45 * zero_rate) + (0.30 * misc_share) + (0.25 * model_gap)),
-                "Reason": "Billing leakage risk combines with model overage for audit priority.",
+                "Score": min(1.0, (0.50 * misc_share) + (0.30 * model_gap) + (0.20 * norm_gap)),
+                "Reason": "Misc-charge concentration and model overage indicate billing-quality audit priority.",
             },
         ]
     else:
@@ -1068,23 +1059,23 @@ def ranked_recommendations(row: pd.Series, baselines: dict[str, float], use_hybr
             },
             {
                 "Action": "Route consolidation and stop-density lift",
-                "Score": min(1.0, (0.35 * norm_gap) + (0.30 * miles_excess) + (0.20 * stop_deficit) + (0.15 * distance_excess)),
+                "Score": min(1.0, (0.20 * norm_gap) + (0.30 * miles_excess) + (0.20 * density_norm_gap) + (0.15 * stop_deficit) + (0.15 * distance_excess)),
                 "Reason": "Normalized-cost pressure plus route profile suggests network inefficiency.",
             },
             {
-                "Action": "Revisit fill DC / lane design",
-                "Score": min(1.0, (0.40 * clean_gap) + (0.25 * distance_excess) + (0.20 * miles_excess) + (0.15 * model_gap)),
-                "Reason": "Cleansheet and travel burden suggest structural lane and assignment redesign.",
+                "Action": "Optimize fill DC allocation",
+                "Score": min(1.0, (0.30 * clean_gap) + (0.20 * distance_excess) + (0.20 * miles_excess) + (0.15 * geo_excess) + (0.15 * shipment_excess)),
+                "Reason": "Cleansheet and travel burden suggest structural fill-DC assignment redesign.",
             },
             {
                 "Action": "Fuel program and surcharge validation",
-                "Score": min(1.0, (0.40 * fuel_share) + (0.25 * clean_gap) + (0.20 * distance_excess) + (0.15 * model_gap)),
+                "Score": min(1.0, (0.40 * fuel_share) + (0.20 * clean_gap) + (0.15 * distance_excess) + (0.15 * geo_excess) + (0.10 * shipment_excess)),
                 "Reason": "Fuel share and benchmark gaps indicate surcharge and route-length opportunity.",
             },
             {
                 "Action": "Invoice and accessorial audit",
-                "Score": min(1.0, (0.45 * zero_rate) + (0.35 * misc_share) + (0.20 * norm_gap)),
-                "Reason": "Zero-cost exposure or misc charges suggest billing-quality leakage.",
+                "Score": min(1.0, (0.45 * misc_share) + (0.25 * norm_gap) + (0.15 * model_gap) + (0.15 * ship_norm_gap)),
+                "Reason": "Misc-charge concentration and benchmark gaps suggest billing-quality leakage.",
             },
         ]
 
@@ -1148,7 +1139,23 @@ def second_action_confidence(row: pd.Series, baselines: dict[str, float]) -> str
     return ranked[1]["Confidence"] if len(ranked) > 1 else "n/a"
 
 
-def render_recommendation_detail_body(row: pd.Series, baselines: dict[str, float]) -> None:
+def _popup_raw_records(row: pd.Series, raw_df: pd.DataFrame | None) -> pd.DataFrame:
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+
+    records = raw_df.copy()
+    selected_market = str(row.get("Market / Xdock", "")).strip()
+    if selected_market and "XDOCK" in records.columns:
+        records = records[records["XDOCK"].astype(str).eq(selected_market)]
+
+    selected_carrier = str(row.get("Carrier", "")).strip()
+    if selected_carrier and selected_carrier not in {"All carriers", "n/a"} and "CARRIER_SCAC_CD" in records.columns:
+        records = records[records["CARRIER_SCAC_CD"].astype(str).eq(selected_carrier)]
+
+    return records
+
+
+def render_recommendation_detail_body(row: pd.Series, baselines: dict[str, float], raw_df: pd.DataFrame | None = None) -> None:
     ranked = ranked_recommendations(row, baselines)
     st.markdown(f"**Market / Xdock:** {row.get('Market / Xdock', 'n/a')}")
     st.markdown(
@@ -1187,16 +1194,56 @@ def render_recommendation_detail_body(row: pd.Series, baselines: dict[str, float
             },
         )
 
+    raw_records = _popup_raw_records(row, raw_df)
+    st.markdown("### Source records from CSV")
+    if raw_records.empty:
+        st.info("No source rows found for this selection under current filters.")
+        return
+
+    st.caption(f"Matched rows: {len(raw_records):,}. Showing first 300.")
+    preferred_cols = [
+        "XDOCK",
+        "FILL_DC_CD",
+        "YEAR",
+        "MONTH",
+        "ROUTE_ID",
+        "CNSLDTN_ID",
+        "JOB_ID",
+        "DLVRY_ACTL_DATETIME",
+        "DELIVERY_TYPE",
+        "CARRIER_SCAC_CD",
+        TARGET,
+        "normalized_cost",
+        "normalized_cost_geography",
+        "normalized_cost_shipment",
+        "normalized_cost_density",
+        "GEOGRAPHY_MULTIPLIER",
+        "shipment_norm_multiplier_qt",
+        "miles_per_stop_norm_multiplier_qt",
+    ]
+    preview_cols = existing_cols(raw_records, preferred_cols)
+    preview_df = raw_records[preview_cols].head(300) if preview_cols else raw_records.head(300)
+    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+    selected_market = str(row.get("Market / Xdock", "selected_market")).replace("/", "_")
+    st.download_button(
+        "Download matched source records",
+        raw_records.to_csv(index=False).encode("utf-8"),
+        file_name=f"source_records_{selected_market}.csv",
+        mime="text/csv",
+        key=f"download_source_records_{selected_market}",
+    )
+
 
 if hasattr(st, "dialog"):
     @st.dialog("Recommendation details", width="large")
-    def open_recommendation_popup(section_title: str, row: pd.Series, baselines: dict[str, float]) -> None:
+    def open_recommendation_popup(section_title: str, row: pd.Series, baselines: dict[str, float], raw_df: pd.DataFrame | None = None) -> None:
         st.markdown(f"### {section_title}")
-        render_recommendation_detail_body(row, baselines)
+        render_recommendation_detail_body(row, baselines, raw_df=raw_df)
 else:
-    def open_recommendation_popup(section_title: str, row: pd.Series, baselines: dict[str, float]) -> None:
+    def open_recommendation_popup(section_title: str, row: pd.Series, baselines: dict[str, float], raw_df: pd.DataFrame | None = None) -> None:
         st.markdown(f"### {section_title}")
-        render_recommendation_detail_body(row, baselines)
+        render_recommendation_detail_body(row, baselines, raw_df=raw_df)
 
 
 def recommendation_feature_columns(df: pd.DataFrame) -> list[str]:
@@ -1214,9 +1261,11 @@ def recommendation_feature_columns(df: pd.DataFrame) -> list[str]:
             "Combined Sensitivity",
             "Records With CPS",
             "Total Records",
-            "Zero Cost Rate",
             "Confidence Score",
             "median_distance_val",
+            "median_normalized_cost_shipment",
+            "median_normalized_cost_density",
+            "median_shipment_norm_multiplier_qt",
             "median_miles_per_stop_norm_multiplier_qt",
             "median_stop_count_val_route_lvl",
             "median_tote_count_val_route_lvl",
@@ -1260,7 +1309,7 @@ def _recommendation_training_frame(df: pd.DataFrame) -> pd.DataFrame:
     train_df = df.copy()
     required = existing_cols(
         train_df,
-        ["Actual CPS", "Expected CPS", "CPS Gap vs Expected %", "Normalized Cost", "Records With CPS", "Zero Cost Rate"],
+        ["Actual CPS", "Expected CPS", "CPS Gap vs Expected %", "Normalized Cost", "Records With CPS"],
     )
     if len(required) < 4:
         return train_df.iloc[0:0].copy()
@@ -1653,6 +1702,7 @@ rca_baselines = {
 }
 for col in [
     "median_distance_val",
+    "median_shipment_norm_multiplier_qt",
     "median_miles_per_stop_norm_multiplier_qt",
     "median_stop_count_val_route_lvl",
     "median_tote_count_val_route_lvl",
@@ -1712,40 +1762,17 @@ if market_options:
         st.markdown(mi_html, unsafe_allow_html=True)
         st.markdown('<div class="tool-note">' + "<br>".join(row_investigation_text(row)) + "</div>", unsafe_allow_html=True)
 
-        rca_items = _root_cause_items(row, rca_baselines)
-        ranked_actions = ranked_recommendations(row, rca_baselines)
-
-        st.markdown("### Root cause analyzer")
-        left, right = st.columns(2)
-        with left:
-            st.markdown(f"**Top root cause**\n\n{root_cause_summary(row, rca_baselines)}")
-            if rca_items:
-                st.markdown("**Contributing drivers**")
-                for item in rca_items[:5]:
-                    st.markdown(f"- {item['label']}: {item['detail']}")
-            else:
-                st.info("No strong driver pattern was detected for this market.")
-        with right:
-            st.markdown(f"**Recommended actions ({recommender_profile} profile)**")
-            for idx, action in enumerate(ranked_actions[:3], start=1):
-                st.markdown(
-                    f"{idx}. {action['Action']} ({action['Impact']} impact, {action['Confidence']} confidence)"
-                )
-                st.caption(action["Reason"])
-
-        st.caption("The analyzer is rules-based: it compares the selected xdock to peer medians in the current filtered view and turns the strongest deviations into action suggestions.")
-
         st.caption("Use the Recommender agent tab for ranked overpay queues, strict all-3-above filtering, and action drilldown.")
 
 # --------------------------------------------------------------------------- #
 # Business charts
 # --------------------------------------------------------------------------- #
 st.subheader("2. Business views")
-tab0, tab00, tab11, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab10 = st.tabs(
+tab11, tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab10 = st.tabs(
     [
+        "Recommender agent",
         "Method Flow",
         "Methodology",
-        "Recommender agent",
         "Signal summary",
         "Cleansheet triangulation",
         "Signal Buckets",
@@ -1885,7 +1912,7 @@ Layer 2: Business Validation → Should we trust the opportunity?
 | Category | Features |
 | --- | --- |
 | **Route Operations** | DISTANCE_VAL, STOP_COUNT_VAL_ROUTE_LVL, TOTE_COUNT_VAL_ROUTE_LVL, STOP_COUNT_VAL, TOTE_COUNT_VAL, ROUTE_COUNT_VAL |
-| **Volume & Quality (count-based)** | paid_records, records, zero_rate, paid_rate |
+| **Volume & Quality (count-based)** | paid_records, records, paid_rate |
 | **Geography** | GEOGRAPHY_MULTIPLIER, geo_mean |
 | **Normalization** | shipment_norm_multiplier_qt, miles_per_stop_norm_multiplier_qt, normalized_cost |
 | **Cost Structure** | LASTMILE_TOTAL_COST, LASTMILE_BASE_COST, LASTMILE_FUEL_COST, LASTMILE_MISC_COST |
@@ -1931,6 +1958,8 @@ The model uses operational characteristics such as:
 - `GEOGRAPHY_MULTIPLIER`, `geo_mean`
 - `shipment_norm_multiplier_qt`, `miles_per_stop_norm_multiplier_qt`
 - `LASTMILE_TOTAL_COST`, `LASTMILE_BASE_COST`, `LASTMILE_FUEL_COST`, `LASTMILE_MISC_COST`
+
+Multiplier meaning (1-line): `GEOGRAPHY_MULTIPLIER` = lane/geography burden, `shipment_norm_multiplier_qt` = shipment volume intensity, `miles_per_stop_norm_multiplier_qt` = stop-density burden; higher values mean structurally harder/more expensive operating conditions versus baseline.
 
 ---
 
@@ -2004,12 +2033,11 @@ Normalized Cost and Cleansheet provide supporting evidence to strengthen or chal
 
 ### 6. Confidence Logic
 
-Confidence is a rule-based score from 0 to 4 points. One point is added for each condition met:
+Confidence is a rule-based score from 0 to 3 points. One point is added for each condition met:
 
 1. Paid records are at least the minimum threshold (`paid_records >= min_group_n`)
 2. Paid records are at least 3x the minimum threshold (`paid_records >= 3 * min_group_n`)
-3. Zero-cost rate is acceptable (`zero_rate <= 35%`)
-4. Combined sensitivity is stable (`combined_sensitivity_abs_pct <= 40%`)
+3. Combined sensitivity is stable (`combined_sensitivity_abs_pct <= 40%`)
 
 Combined sensitivity is the average of:
 
@@ -2020,10 +2048,10 @@ Where Cleansheet Midpoint is the midpoint between conservative and aggressive cl
 
 Confidence labels:
 
-- High: score >= 4
-- Medium: score = 3
-- Low: score = 2
-- Very Low: score <= 1
+- High: score >= 3
+- Medium: score = 2
+- Low: score = 1
+- Very Low: score = 0
 
 Very Low confidence groups are treated as Not enough evidence in final classification.
 
@@ -2116,7 +2144,7 @@ The recommender agent is a hybrid layer that ranks actions after the market is c
 
 - Actual CPS, Expected CPS, CPS Gap vs Expected %
 - Normalized Cost and cleansheet gaps
-- Records With CPS, Total Records, Zero Cost Rate, Confidence Score
+- Records With CPS, Total Records, Confidence Score
 - Route-level medians such as distance, miles-per-stop, stop count, tote count, geography multiplier, and cost mix
 
 #### Model type
@@ -2215,7 +2243,7 @@ with tab11:
             st.session_state["overpay_popup_last_market"] = selected_from_overpay_queue
             popup_row_df = overpay_queue[overpay_queue["Market / Xdock"].astype(str).eq(selected_from_overpay_queue)]
             if not popup_row_df.empty:
-                open_recommendation_popup("Overpay queue drilldown", popup_row_df.iloc[0], rca_baselines)
+                open_recommendation_popup("Overpay queue drilldown", popup_row_df.iloc[0], rca_baselines, raw_df=filtered)
 
         overpay_market_options = overpay_queue["Market / Xdock"].astype(str).tolist()
         if overpay_market_options:
@@ -2237,7 +2265,7 @@ with tab11:
                     overpay_queue["Market / Xdock"].astype(str).eq(selected_overpay_market)
                 ]
                 if not selected_row_df.empty:
-                    open_recommendation_popup("Overpay queue drilldown", selected_row_df.iloc[0], rca_baselines)
+                    open_recommendation_popup("Overpay queue drilldown", selected_row_df.iloc[0], rca_baselines, raw_df=filtered)
 
             overpay_row_df = overpay_queue[
                 overpay_queue["Market / Xdock"].astype(str).eq(selected_overpay_market)
@@ -2318,7 +2346,7 @@ with tab11:
             st.session_state["strict_popup_last_market"] = selected_from_queue
             popup_row_df = strict_overpay_queue[strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_from_queue)]
             if not popup_row_df.empty:
-                open_recommendation_popup("Strict overpay drilldown", popup_row_df.iloc[0], rca_baselines)
+                open_recommendation_popup("Strict overpay drilldown", popup_row_df.iloc[0], rca_baselines, raw_df=filtered)
 
         strict_market_options = strict_overpay_queue["Market / Xdock"].astype(str).tolist()
         if strict_market_options:
@@ -2340,7 +2368,7 @@ with tab11:
                     strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_strict_market)
                 ]
                 if not selected_row_df.empty:
-                    open_recommendation_popup("Strict overpay drilldown", selected_row_df.iloc[0], rca_baselines)
+                    open_recommendation_popup("Strict overpay drilldown", selected_row_df.iloc[0], rca_baselines, raw_df=filtered)
 
             strict_row_df = strict_overpay_queue[
                 strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_strict_market)
@@ -2608,7 +2636,6 @@ with tab4:
                 "CPS Gap vs Expected %": False,
 
                 "Total Records": False,
-                "Zero Cost Rate": False,
                 "Normalization Sensitivity": False,
                 "Expected Low CPS P10": False,
                 "Expected High CPS P90": False,
@@ -3494,14 +3521,13 @@ with st.expander("Methodology and model diagnostics"):
         - Use positive paid rows to calculate market-level actual median CPS.
         - Fit a quantile gradient boosting model to estimate expected CPS bands.
         - P50 is the expected median CPS. P10/P90 define the low/high expected range.
-                - Classification is based on actual CPS versus expected CPS, with confidence checks for volume, zero-cost rate, and combined sensitivity.
+                - Classification is based on actual CPS versus expected CPS, with confidence checks for volume and combined sensitivity.
                 - Combined sensitivity = average of normalization sensitivity and cleansheet sensitivity.
-                - Confidence points (0-4):
+                - Confidence points (0-3):
                     - +1 if paid records >= minimum threshold
                     - +1 if paid records >= 3x minimum threshold
-                    - +1 if zero-cost rate <= 35%
                     - +1 if combined sensitivity <= 40%
-                - Confidence labels: High (4), Medium (3), Low (2), Very Low (0-1).
+                - Confidence labels: High (3), Medium (2), Low (1), Very Low (0).
 
         **Why this is more defensible than normalized cost alone**
         - Normalized cost is included as a supporting metric.
