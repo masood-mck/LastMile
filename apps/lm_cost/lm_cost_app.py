@@ -1195,7 +1195,7 @@ def render_recommendation_detail_body(row: pd.Series, baselines: dict[str, float
         )
 
     raw_records = _popup_raw_records(row, raw_df)
-    st.markdown("### Source records from CSV")
+    st.markdown("### Source records")
     if raw_records.empty:
         st.info("No source rows found for this selection under current filters.")
         return
@@ -1728,52 +1728,54 @@ with st.expander("Quick interpretation", expanded=False):
 # --------------------------------------------------------------------------- #
 # Market investigation tool
 # --------------------------------------------------------------------------- #
-st.subheader("1. Market investigation")
-market_options = business_view["Market / Xdock"].astype(str).tolist()
-if market_options:
-    if "market_picker" not in st.session_state:
-        st.session_state["market_picker"] = market_options[0]
-    if st.session_state.get("market_picker") not in market_options:
-        st.session_state["market_picker"] = market_options[0]
+top_market_tab, top_reco_tab = st.tabs(["Market investigation", "Recommendation agent"])
 
-    selected_market = st.selectbox("Choose market / xdock", market_options, key="market_picker")
-    row_df = business_view[business_view["Market / Xdock"].astype(str).eq(selected_market)]
-    if not row_df.empty:
-        row = row_df.iloc[0]
-        classification = row.get("Signal / Classification", "n/a")
-        confidence = row.get("Confidence", "n/a")
-        cls_color = CLASS_COLORS.get(classification, MCK_GRAY)
-        st.markdown(
-            f'<div style="display:inline-block;padding:.35rem .9rem;border-radius:6px;'
-            f'background:{cls_color};color:white;font-weight:700;font-size:.95rem;margin-bottom:.6rem;">'
-            f'{classification} &nbsp;·&nbsp; {confidence} confidence</div>',
-            unsafe_allow_html=True,
-        )
-        metrics = [
-            ("Actual CPS", money(row.get("Actual CPS")), pct(row.get("CPS Gap vs Expected %"))),
-            ("Expected CPS", money(row.get("Expected CPS")), "P50"),
-            ("Expected high", money(row.get("Expected High CPS P90")), "P90"),
-            ("Normalized", money(row.get("Normalized Cost")), plain_pct(row.get("Normalization Sensitivity"))),
-            ("CS conservative", money(row.get("Cleansheet Conservative")), "benchmark"),
-            ("CS aggressive", money(row.get("Cleansheet Aggressive")), "benchmark"),
-            ("Records With CPS", f"{int(row.get('Records With CPS', 0)):,}", str(row.get("Confidence", ""))),
-        ]
-        mi_html = '<div class="mi-row">' + "".join(
-            f'<div class="mi-card"><div class="mi-lbl">{lbl}</div><div class="mi-val">{val}</div><div class="mi-sub">{sub}</div></div>'
-            for lbl, val, sub in metrics
-        ) + "</div>"
-        st.markdown(mi_html, unsafe_allow_html=True)
-        st.markdown('<div class="tool-note">' + "<br>".join(row_investigation_text(row)) + "</div>", unsafe_allow_html=True)
+with top_market_tab:
+    st.subheader("1. Market investigation")
+    market_options = business_view["Market / Xdock"].astype(str).tolist()
+    if market_options:
+        if "market_picker" not in st.session_state:
+            st.session_state["market_picker"] = market_options[0]
+        if st.session_state.get("market_picker") not in market_options:
+            st.session_state["market_picker"] = market_options[0]
 
-        st.caption("Use the Recommender agent tab for ranked overpay queues, strict all-3-above filtering, and action drilldown.")
+        selected_market = st.selectbox("Choose market / xdock", market_options, key="market_picker")
+        row_df = business_view[business_view["Market / Xdock"].astype(str).eq(selected_market)]
+        if not row_df.empty:
+            row = row_df.iloc[0]
+            classification = row.get("Signal / Classification", "n/a")
+            confidence = row.get("Confidence", "n/a")
+            cls_color = CLASS_COLORS.get(classification, MCK_GRAY)
+            st.markdown(
+                f'<div style="display:inline-block;padding:.35rem .9rem;border-radius:6px;'
+                f'background:{cls_color};color:white;font-weight:700;font-size:.95rem;margin-bottom:.6rem;">'
+                f'{classification} &nbsp;·&nbsp; {confidence} confidence</div>',
+                unsafe_allow_html=True,
+            )
+            metrics = [
+                ("Actual CPS", money(row.get("Actual CPS")), pct(row.get("CPS Gap vs Expected %"))),
+                ("Expected CPS", money(row.get("Expected CPS")), "P50"),
+                ("Expected high", money(row.get("Expected High CPS P90")), "P90"),
+                ("Normalized", money(row.get("Normalized Cost")), plain_pct(row.get("Normalization Sensitivity"))),
+                ("CS conservative", money(row.get("Cleansheet Conservative")), "benchmark"),
+                ("CS aggressive", money(row.get("Cleansheet Aggressive")), "benchmark"),
+                ("Records With CPS", f"{int(row.get('Records With CPS', 0)):,}", str(row.get("Confidence", ""))),
+            ]
+            mi_html = '<div class="mi-row">' + "".join(
+                f'<div class="mi-card"><div class="mi-lbl">{lbl}</div><div class="mi-val">{val}</div><div class="mi-sub">{sub}</div></div>'
+                for lbl, val, sub in metrics
+            ) + "</div>"
+            st.markdown(mi_html, unsafe_allow_html=True)
+            st.markdown('<div class="tool-note">' + "<br>".join(row_investigation_text(row)) + "</div>", unsafe_allow_html=True)
+
+            st.caption("Use the Recommender agent tab for ranked overpay queues, strict all-3-above filtering, and action drilldown.")
 
 # --------------------------------------------------------------------------- #
 # Business charts
 # --------------------------------------------------------------------------- #
 st.subheader("2. Business views")
-tab11, tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab10 = st.tabs(
+tab0, tab00, tab01, tab4, tab9, tab1, tab2, tab3, tab5, tab6, tab7, tab8, tab10 = st.tabs(
     [
-        "Recommender agent",
         "Method Flow",
         "Methodology",
         "Signal summary",
@@ -2178,7 +2180,7 @@ The recommender agent is a hybrid layer that ranks actions after the market is c
         hide_index=True,
     )
 
-with tab11:
+with top_reco_tab:
     st.subheader("Recommender agent")
     st.caption("Action queues for overpay markets, plus drilldown recommendations.")
     st.caption("Expected CPS is generated by an ML model; recommendation ranking blends an ML action-probability model with rules-based agent scoring.")
