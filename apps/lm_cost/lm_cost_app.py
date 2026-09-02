@@ -2309,6 +2309,14 @@ The recommender agent is a hybrid layer that ranks actions after the market is c
 
 with top_reco_tab:
     st.subheader("Recommender agent")
+    
+    # Combined search for both tables
+    combined_search_query = st.text_input(
+        "Search overpay queues",
+        value="",
+        key="combined_overpay_search_query",
+        placeholder="Type market, root cause, recommendation, or confidence",
+    )
 
     overpay_queue = business_view[business_view["Signal / Classification"].eq("Overpay candidate")].copy()
     if len(overpay_queue):
@@ -2320,7 +2328,7 @@ with top_reco_tab:
         overpay_queue["Action 2 Impact"] = overpay_queue.apply(lambda r: second_action_impact(r, rca_baselines), axis=1)
         overpay_queue["Action 2 Confidence"] = overpay_queue.apply(lambda r: second_action_confidence(r, rca_baselines), axis=1)
 
-        st.markdown("### Overpay queue")
+        st.markdown("### Overpay queue (Expected CPS gap driven)")
         queue_cols = existing_cols(
             overpay_queue,
             [
@@ -2329,6 +2337,8 @@ with top_reco_tab:
                 "CPS Gap vs Expected %",
                 "Actual CPS",
                 "Expected CPS",
+                "Normalized Cost",
+                "Cleansheet Aggressive",
                 "Records With CPS",
                 "Top Root Cause",
                 "Recommendation 1",
@@ -2340,40 +2350,8 @@ with top_reco_tab:
             ],
         )
         overpay_queue = overpay_queue.sort_values(["CPS Gap vs Expected %", "Records With CPS"], ascending=[False, False])
-        overpay_search_query = st.text_input(
-            "Search overpay queue",
-            value="",
-            key="overpay_queue_search_query",
-            placeholder="Type market, root cause, recommendation, or confidence",
-        )
-        overpay_show = filter_table_rows(overpay_queue[queue_cols], overpay_search_query).head(200)
+        overpay_show = filter_table_rows(overpay_queue[queue_cols], combined_search_query).head(200)
         st.caption(f"Showing {len(overpay_show)} of {len(overpay_queue)} rows")
-
-        selected_from_overpay_queue = None
-        try:
-            overpay_event = st.dataframe(
-                overpay_show,
-                use_container_width=True,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="overpay_queue_table",
-            )
-            selected_rows = selected_rows_from_event(overpay_event)
-            if selected_rows:
-                selected_from_overpay_queue = overpay_show.iloc[selected_rows[0]]["Market / Xdock"]
-        except TypeError:
-            st.dataframe(
-                overpay_show,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        if selected_from_overpay_queue and selected_from_overpay_queue != st.session_state.get("overpay_popup_last_market"):
-            st.session_state["overpay_popup_last_market"] = selected_from_overpay_queue
-            popup_row_df = overpay_queue[overpay_queue["Market / Xdock"].astype(str).eq(selected_from_overpay_queue)]
-            if not popup_row_df.empty:
-                open_recommendation_popup("Overpay queue drilldown", popup_row_df.iloc[0], rca_baselines, raw_df=filtered)
 
         overpay_market_options = overpay_queue["Market / Xdock"].astype(str).tolist()
         if overpay_market_options:
@@ -2381,8 +2359,6 @@ with top_reco_tab:
                 st.session_state["overpay_picker"] = overpay_market_options[0]
             if st.session_state.get("overpay_picker") not in overpay_market_options:
                 st.session_state["overpay_picker"] = overpay_market_options[0]
-            if selected_from_overpay_queue and selected_from_overpay_queue in overpay_market_options:
-                st.session_state["overpay_picker"] = selected_from_overpay_queue
 
             selected_overpay_market = st.selectbox(
                 "Drilldown market from overpay queue",
@@ -2397,11 +2373,41 @@ with top_reco_tab:
                 if not selected_row_df.empty:
                     open_recommendation_popup("Overpay queue drilldown", selected_row_df.iloc[0], rca_baselines, raw_df=filtered)
 
-            overpay_row_df = overpay_queue[
-                overpay_queue["Market / Xdock"].astype(str).eq(selected_overpay_market)
-            ]
-            if not overpay_row_df.empty:
-                st.caption("Select a row to open popup details, or use the button to open the selected market.")
+        selected_from_overpay_queue = None
+        try:
+            overpay_event = st.dataframe(
+                overpay_show,
+                use_container_width=True,
+                hide_index=True,
+                selection_mode="single-row",
+                key="overpay_queue_table",
+            )
+            selected_rows = selected_rows_from_event(overpay_event)
+            if selected_rows:
+                selected_from_overpay_queue = overpay_show.iloc[selected_rows[0]]["Market / Xdock"]
+        except TypeError:
+            st.dataframe(
+                overpay_show,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # Buttons for row selection popup
+        if selected_from_overpay_queue:
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Open selected row details", key="open_selected_overpay_popup"):
+                    popup_row_df = overpay_queue[overpay_queue["Market / Xdock"].astype(str).eq(selected_from_overpay_queue)]
+                    if not popup_row_df.empty:
+                        open_recommendation_popup("Overpay queue drilldown", popup_row_df.iloc[0], rca_baselines, raw_df=filtered)
+            with col2:
+                if st.button("Deselect row", key="deselect_overpay_popup"):
+                    st.session_state["overpay_queue_table"] = {"selection": {"rows": []}}
+                    st.rerun()
+
+        # sync row-click selection to picker for next rerun
+        if overpay_market_options and selected_from_overpay_queue and selected_from_overpay_queue in overpay_market_options:
+            st.session_state["overpay_picker"] = selected_from_overpay_queue
     else:
         st.info("No overpay candidates with the current filters.")
 
@@ -2416,7 +2422,7 @@ with top_reco_tab:
         & (business_view["Actual CPS"] > business_view["Cleansheet Aggressive"])
     ].copy()
 
-    st.markdown("### Strict overpay queue (actual above all 3 reference costs)")
+    st.markdown("### Strict overpay queue (confirmed by all 3 reference costs)")
     st.caption(
         "Rules: Overpay candidate and Actual CPS > Expected CPS (model reference), Actual CPS > Normalized Cost (peer-normalized reference), and Actual CPS > Cleansheet Aggressive (cleansheet reference)."
     )
@@ -2451,40 +2457,8 @@ with top_reco_tab:
             ],
         )
         strict_show = strict_overpay_queue[strict_cols]
-        strict_search_query = st.text_input(
-            "Search strict overpay queue",
-            value="",
-            key="strict_overpay_queue_search_query",
-            placeholder="Type market, root cause, recommendation, or confidence",
-        )
-        strict_show = filter_table_rows(strict_show, strict_search_query).head(200)
+        strict_show = filter_table_rows(strict_show, combined_search_query).head(200)
         st.caption(f"Showing {len(strict_show)} of {len(strict_overpay_queue)} rows")
-
-        selected_from_queue = None
-        try:
-            queue_event = st.dataframe(
-                strict_show,
-                use_container_width=True,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="strict_overpay_queue_table",
-            )
-            selected_rows = selected_rows_from_event(queue_event)
-            if selected_rows:
-                selected_from_queue = strict_overpay_queue.iloc[selected_rows[0]]["Market / Xdock"]
-        except TypeError:
-            st.dataframe(
-                strict_show,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        if selected_from_queue and selected_from_queue != st.session_state.get("strict_popup_last_market"):
-            st.session_state["strict_popup_last_market"] = selected_from_queue
-            popup_row_df = strict_overpay_queue[strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_from_queue)]
-            if not popup_row_df.empty:
-                open_recommendation_popup("Strict overpay drilldown", popup_row_df.iloc[0], rca_baselines, raw_df=filtered)
 
         strict_market_options = strict_overpay_queue["Market / Xdock"].astype(str).tolist()
         if strict_market_options:
@@ -2492,8 +2466,6 @@ with top_reco_tab:
                 st.session_state["strict_overpay_picker"] = strict_market_options[0]
             if st.session_state.get("strict_overpay_picker") not in strict_market_options:
                 st.session_state["strict_overpay_picker"] = strict_market_options[0]
-            if selected_from_queue and selected_from_queue in strict_market_options:
-                st.session_state["strict_overpay_picker"] = selected_from_queue
 
             selected_strict_market = st.selectbox(
                 "Drilldown market from strict queue",
@@ -2508,11 +2480,41 @@ with top_reco_tab:
                 if not selected_row_df.empty:
                     open_recommendation_popup("Strict overpay drilldown", selected_row_df.iloc[0], rca_baselines, raw_df=filtered)
 
-            strict_row_df = strict_overpay_queue[
-                strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_strict_market)
-            ]
-            if not strict_row_df.empty:
-                st.caption("Select a row to open popup details, or use the button to open the selected market.")
+        selected_from_queue = None
+        try:
+            queue_event = st.dataframe(
+                strict_show,
+                use_container_width=True,
+                hide_index=True,
+                selection_mode="single-row",
+                key="strict_overpay_queue_table",
+            )
+            selected_rows = selected_rows_from_event(queue_event)
+            if selected_rows:
+                selected_from_queue = strict_overpay_queue.iloc[selected_rows[0]]["Market / Xdock"]
+        except TypeError:
+            st.dataframe(
+                strict_show,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        # Buttons for row selection popup
+        if selected_from_queue:
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Open selected row details", key="open_selected_strict_popup"):
+                    popup_row_df = strict_overpay_queue[strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_from_queue)]
+                    if not popup_row_df.empty:
+                        open_recommendation_popup("Strict overpay drilldown", popup_row_df.iloc[0], rca_baselines, raw_df=filtered)
+            with col2:
+                if st.button("Deselect row", key="deselect_strict_popup"):
+                    st.session_state["strict_overpay_queue_table"] = {"selection": {"rows": []}}
+                    st.rerun()
+
+        # sync row-click selection to picker for next rerun
+        if strict_market_options and selected_from_queue and selected_from_queue in strict_market_options:
+            st.session_state["strict_overpay_picker"] = selected_from_queue
     else:
         st.info("No xdock meets the strict all-3-reference-cost condition with the current filters.")
 
