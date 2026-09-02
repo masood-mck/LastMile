@@ -2379,6 +2379,7 @@ with top_reco_tab:
                 overpay_show,
                 use_container_width=True,
                 hide_index=True,
+                on_select="rerun",
                 selection_mode="single-row",
                 key="overpay_queue_table",
             )
@@ -2404,6 +2405,22 @@ with top_reco_tab:
             ):
                 selected_from_overpay_queue = persisted_overpay_market
 
+        # Auto-open popup when a new row is selected in the table.
+        if selected_from_overpay_queue:
+            last_opened_overpay_market = st.session_state.get("overpay_last_opened_market")
+            if selected_from_overpay_queue != last_opened_overpay_market:
+                popup_row_df = overpay_queue[
+                    overpay_queue["Market / Xdock"].astype(str).eq(selected_from_overpay_queue)
+                ]
+                if not popup_row_df.empty:
+                    st.session_state["overpay_last_opened_market"] = selected_from_overpay_queue
+                    open_recommendation_popup(
+                        "Overpay queue drilldown",
+                        popup_row_df.iloc[0],
+                        rca_baselines,
+                        raw_df=filtered,
+                    )
+
         # Buttons for row selection popup
         col1, col2 = st.columns(2)
         with col1:
@@ -2419,6 +2436,7 @@ with top_reco_tab:
             if st.button("Deselect row", key="deselect_overpay_popup", disabled=not bool(selected_from_overpay_queue)):
                 st.session_state["overpay_queue_table"] = {"selection": {"rows": []}}
                 st.session_state["overpay_selected_market"] = None
+                st.session_state["overpay_last_opened_market"] = None
                 st.rerun()
 
         # sync row-click selection to picker for next rerun
@@ -2502,6 +2520,7 @@ with top_reco_tab:
                 strict_show,
                 use_container_width=True,
                 hide_index=True,
+                on_select="rerun",
                 selection_mode="single-row",
                 key="strict_overpay_queue_table",
             )
@@ -2527,6 +2546,22 @@ with top_reco_tab:
             ):
                 selected_from_queue = persisted_strict_market
 
+        # Auto-open popup when a new row is selected in the table.
+        if selected_from_queue:
+            last_opened_strict_market = st.session_state.get("strict_last_opened_market")
+            if selected_from_queue != last_opened_strict_market:
+                popup_row_df = strict_overpay_queue[
+                    strict_overpay_queue["Market / Xdock"].astype(str).eq(selected_from_queue)
+                ]
+                if not popup_row_df.empty:
+                    st.session_state["strict_last_opened_market"] = selected_from_queue
+                    open_recommendation_popup(
+                        "Strict overpay drilldown",
+                        popup_row_df.iloc[0],
+                        rca_baselines,
+                        raw_df=filtered,
+                    )
+
         # Buttons for row selection popup
         col1, col2 = st.columns(2)
         with col1:
@@ -2542,6 +2577,7 @@ with top_reco_tab:
             if st.button("Deselect row", key="deselect_strict_popup", disabled=not bool(selected_from_queue)):
                 st.session_state["strict_overpay_queue_table"] = {"selection": {"rows": []}}
                 st.session_state["strict_selected_market"] = None
+                st.session_state["strict_last_opened_market"] = None
                 st.rerun()
 
         # sync row-click selection to picker for next rerun
