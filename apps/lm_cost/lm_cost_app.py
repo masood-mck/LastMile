@@ -86,6 +86,13 @@ CLASS_COLORS = {
 }
 
 RECOMMENDER_MODEL_PACK: dict | None = None
+RECOMMENDATION_ACTIONS = [
+    "Renegotiate rate card / sourcing",
+    "Route consolidation and stop-density lift",
+    "Optimize fill DC allocation",
+    "Fuel program and surcharge validation",
+    "Invoice and accessorial audit",
+]
 
 # --------------------------------------------------------------------------- #
 # Utility helpers
@@ -119,6 +126,16 @@ def clean_col_name(c: str) -> str:
         .replace("(", "")
         .replace(")", "")
     )
+
+
+def filter_table_rows(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    q = str(query or "").strip()
+    if not q:
+        return df
+    mask = pd.Series(False, index=df.index)
+    for col in df.columns:
+        mask = mask | df[col].astype(str).str.contains(q, case=False, na=False, regex=False)
+    return df[mask]
 
 
 def money(x, digits=2):
@@ -1353,22 +1370,30 @@ def recommendation_confidence_score(row: pd.Series) -> float:
 
 def recommendation_action_probabilities(row: pd.Series) -> dict[str, float]:
     pack = RECOMMENDER_MODEL_PACK
-    if not pack or pack.get("status") != "hybrid model":
+    if not pack:
         return {}
+
+    action_priors = pack.get("action_priors", {}) or {}
+    if pack.get("status") != "hybrid model":
+        return {action: float(action_priors.get(action, 0.0)) for action in RECOMMENDATION_ACTIONS}
 
     model = pack.get("model")
     feature_cols = pack.get("feature_cols", [])
     if model is None or not feature_cols:
-        return {}
+        return {action: float(action_priors.get(action, 0.0)) for action in RECOMMENDATION_ACTIONS}
 
     row_df = pd.DataFrame([row]).reindex(columns=feature_cols)
     try:
         probs = model.predict_proba(row_df)[0]
     except Exception:
-        return {}
+        return {action: float(action_priors.get(action, 0.0)) for action in RECOMMENDATION_ACTIONS}
 
     actions = list(model.named_steps["model"].classes_)
-    return {action: float(prob) for action, prob in zip(actions, probs)}
+    predicted = {action: float(prob) for action, prob in zip(actions, probs)}
+    merged = {}
+    for action in RECOMMENDATION_ACTIONS:
+        merged[action] = float(predicted.get(action, action_priors.get(action, 0.0)))
+    return merged
 
 
 def _recommendation_training_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -1391,10 +1416,12 @@ def train_recommendation_agent(df: pd.DataFrame, baselines: dict[str, float], ra
     train_df["Confidence Score"] = train_df.apply(recommendation_confidence_score, axis=1)
     feature_cols = recommendation_feature_columns(train_df)
     if len(train_df) < 40 or len(feature_cols) < 6:
+        uniform_priors = {action: 1.0 / len(RECOMMENDATION_ACTIONS) for action in RECOMMENDATION_ACTIONS}
         return {
             "status": "fallback",
             "model": None,
             "feature_cols": feature_cols,
+            "action_priors": uniform_priors,
             "metrics": {
                 "training_rows": int(len(train_df)),
                 "feature_count": int(len(feature_cols)),
@@ -1407,6 +1434,10 @@ def train_recommendation_agent(df: pd.DataFrame, baselines: dict[str, float], ra
         lambda r: ranked_recommendations(r, baselines, use_hybrid=False)[0]["Action"],
         axis=1,
     )
+    action_counts_full = labeled_df["Agent Top Action"].value_counts(normalize=True)
+    action_priors = {action: float(action_counts_full.get(action, 0.0)) for action in RECOMMENDATION_ACTIONS}
+    if sum(action_priors.values()) <= 0:
+        action_priors = {action: 1.0 / len(RECOMMENDATION_ACTIONS) for action in RECOMMENDATION_ACTIONS}
 
     action_counts = labeled_df["Agent Top Action"].value_counts()
     if action_counts.nunique() == 0 or action_counts.min() < 2 or action_counts.shape[0] < 2:
@@ -1414,6 +1445,7 @@ def train_recommendation_agent(df: pd.DataFrame, baselines: dict[str, float], ra
             "status": "fallback",
             "model": None,
             "feature_cols": feature_cols,
+            "action_priors": action_priors,
             "metrics": {
                 "training_rows": int(len(train_df)),
                 "feature_count": int(len(feature_cols)),
@@ -1466,6 +1498,7 @@ def train_recommendation_agent(df: pd.DataFrame, baselines: dict[str, float], ra
         "status": "hybrid model",
         "model": pipe,
         "feature_cols": feature_cols,
+        "action_priors": action_priors,
         "metrics": metrics,
     }
 
@@ -2307,7 +2340,14 @@ with top_reco_tab:
             ],
         )
         overpay_queue = overpay_queue.sort_values(["CPS Gap vs Expected %", "Records With CPS"], ascending=[False, False])
-        overpay_show = overpay_queue[queue_cols].head(40)
+        overpay_search_query = st.text_input(
+            "Search overpay queue",
+            value="",
+            key="overpay_queue_search_query",
+            placeholder="Type market, root cause, recommendation, or confidence",
+        )
+        overpay_show = filter_table_rows(overpay_queue[queue_cols], overpay_search_query).head(200)
+        st.caption(f"Showing {len(overpay_show)} of {len(overpay_queue)} rows")
 
         selected_from_overpay_queue = None
         try:
@@ -2411,6 +2451,14 @@ with top_reco_tab:
             ],
         )
         strict_show = strict_overpay_queue[strict_cols]
+        strict_search_query = st.text_input(
+            "Search strict overpay queue",
+            value="",
+            key="strict_overpay_queue_search_query",
+            placeholder="Type market, root cause, recommendation, or confidence",
+        )
+        strict_show = filter_table_rows(strict_show, strict_search_query).head(200)
+        st.caption(f"Showing {len(strict_show)} of {len(strict_overpay_queue)} rows")
 
         selected_from_queue = None
         try:

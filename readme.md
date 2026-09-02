@@ -23,6 +23,34 @@ Do not commit generated artifacts from `apps/lm_cost/data`:
 
 These generated files are now ignored by git.
 
+## After Data Refresh: Push Checklist
+
+When you refresh data and want to push:
+
+Include only source changes (if modified):
+
+- apps/lm_cost/lm_cost_app.py
+- apps/lm_cost/precompute_lm_cost_all.py
+- apps/lm_cost/precompute_lm_cost_all.ipynb
+- apps/lm_cost/preprocess_lm_cost_data.ipynb
+- apps/lm_cost/precompute_lm_cost_scorecard.ipynb
+- apps/lm_cost/Dockerfile
+- README.md
+- .gitignore
+
+Exclude regenerated artifacts in apps/lm_cost/data:
+
+- LM_CS_slim_prepared.pkl
+- LM_CS_slim_prepared.parquet
+- LM_CS_slim_preprocess_manifest.json
+- LM_CS_scorecard_default.pkl
+- LM_CS_scorecard_default_manifest.json
+
+Rule of thumb:
+
+- Commit code, logic, and documentation changes.
+- Do not commit regenerated data artifacts.
+
 ## Docker Build Behavior
 
 The Dockerfile now precomputes artifacts at build time when `data/LM_CS_slim.csv.gz` is present:
