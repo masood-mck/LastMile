@@ -22,7 +22,17 @@ jobs:
 
       - name: Build Image
         run: |
-          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/lm-cost:latest ./apps/lm_cost
+          for attempt in 1 2 3; do
+            echo "Docker build attempt ${attempt}/3"
+            if docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/lm-cost:latest ./apps/lm_cost; then
+              exit 0
+            fi
+            if [ "${attempt}" -lt 3 ]; then
+              echo "Build failed, retrying after transient registry error..."
+              sleep 15
+            fi
+          done
+          exit 1
 
       - name: Push Image
         run: |

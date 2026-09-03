@@ -200,6 +200,7 @@ def build_xdock_geo_view(raw_df: pd.DataFrame, business_view: pd.DataFrame) -> p
     lat_col = _first_present(
         raw_df,
         [
+            "ORIGIN_LATITUDE",
             "XDOCK_LATITUDE",
             "DESTINATION_LATITUDE",
             "latitude",
@@ -210,6 +211,7 @@ def build_xdock_geo_view(raw_df: pd.DataFrame, business_view: pd.DataFrame) -> p
     lon_col = _first_present(
         raw_df,
         [
+            "ORIGIN_LONGITUDE",
             "XDOCK_LONGITUDE",
             "DESTINATION_LONGITUDE",
             "longitude",
@@ -324,7 +326,7 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Map is ready, but the app data does not yet include xdock latitude/longitude columns.")
-            st.caption("Your notebook geocodes query can be used once DESTINATION_LATITUDE and DESTINATION_LONGITUDE are merged into the exported app dataset.")
+            st.caption("Your notebook geocodes query can be used once ORIGIN_LATITUDE and ORIGIN_LONGITUDE are merged into the exported app dataset.")
 
     with queue_col:
         st.markdown("### Priority queue")

@@ -11,4 +11,4 @@ command:
 
 env:
   - name: NORM_DATA_PATH
-    value: "/Workspace/Users/sgt4gul@mckessoncorp.onmicrosoft.com/Last Mile/LastMile/apps/lm_cost/data/LM_CS_slim.csv"
+    value: "/Workspace/Users/sgt4gul@mckessoncorp.onmicrosoft.com/Last Mile/LastMile/apps/lm_cost/data/LM_CS_slim.csv.gz"
