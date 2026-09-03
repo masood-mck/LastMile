@@ -195,6 +195,211 @@ def selected_rows_from_event(event) -> list[int]:
     rows = getattr(selection, "rows", None)
     return list(rows) if rows is not None else []
 
+
+def build_xdock_geo_view(raw_df: pd.DataFrame, business_view: pd.DataFrame) -> pd.DataFrame:
+    lat_col = _first_present(
+        raw_df,
+        [
+            "XDOCK_LATITUDE",
+            "DESTINATION_LATITUDE",
+            "latitude",
+            "Latitude",
+            "LATITUDE",
+        ],
+    )
+    lon_col = _first_present(
+        raw_df,
+        [
+            "XDOCK_LONGITUDE",
+            "DESTINATION_LONGITUDE",
+            "longitude",
+            "Longitude",
+            "LONGITUDE",
+        ],
+    )
+    xdock_col = _first_present(raw_df, ["XDOCK", "DC_CD"])
+
+    if lat_col is None or lon_col is None or xdock_col is None:
+        return pd.DataFrame()
+
+    geo = raw_df[[xdock_col, lat_col, lon_col]].copy()
+    geo = geo.rename(columns={xdock_col: "XDOCK", lat_col: "latitude", lon_col: "longitude"})
+    geo["XDOCK"] = geo["XDOCK"].astype(str).str.upper().str.strip()
+    geo["latitude"] = pd.to_numeric(geo["latitude"], errors="coerce")
+    geo["longitude"] = pd.to_numeric(geo["longitude"], errors="coerce")
+    geo = geo.dropna(subset=["latitude", "longitude"])
+    geo = geo[(geo["latitude"] != 0) & (geo["longitude"] != 0)]
+    if geo.empty:
+        return pd.DataFrame()
+
+    geo = geo.groupby("XDOCK", as_index=False).agg(latitude=("latitude", "median"), longitude=("longitude", "median"))
+
+    view = business_view.copy()
+    if "Market / Xdock" not in view.columns:
+        return pd.DataFrame()
+    view["Market / Xdock"] = view["Market / Xdock"].astype(str).str.upper().str.strip()
+    return view.merge(geo, left_on="Market / Xdock", right_on="XDOCK", how="left")
+
+
+def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -> None:
+    st.subheader("Executive view")
+
+    exec_view = geo_view.copy()
+    if exec_view.empty:
+        st.info("No scored market view is available for the executive summary.")
+        return
+
+    exec_view["Estimated Opportunity"] = np.where(
+        exec_view["CPS Gap vs Expected"].fillna(0).gt(0),
+        exec_view["CPS Gap vs Expected"].fillna(0) * exec_view["Records With CPS"].fillna(0),
+        0.0,
+    )
+
+    overpay_view = exec_view[exec_view["Signal / Classification"].eq("Overpay candidate")].copy()
+    strict_view = exec_view[
+        exec_view["Signal / Classification"].eq("Overpay candidate")
+        & exec_view["Actual CPS"].notna()
+        & exec_view["Expected CPS"].notna()
+        & exec_view["Normalized Cost"].notna()
+        & exec_view["Cleansheet Aggressive"].notna()
+        & (exec_view["Actual CPS"] > exec_view["Expected CPS"])
+        & (exec_view["Actual CPS"] > exec_view["Normalized Cost"])
+        & (exec_view["Actual CPS"] > exec_view["Cleansheet Aggressive"])
+    ].copy()
+
+    total_opportunity = float(overpay_view["Estimated Opportunity"].fillna(0).sum())
+    median_gap = overpay_view["CPS Gap vs Expected %"].median() if len(overpay_view) else np.nan
+    high_conf_count = int(overpay_view["Confidence"].eq("High").sum()) if "Confidence" in overpay_view.columns else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Overpay markets", f"{len(overpay_view):,}")
+    c2.metric("Strict overpay", f"{len(strict_view):,}")
+    c3.metric("Estimated opportunity", money(total_opportunity, digits=0))
+    c4.metric("Median overpay gap", plain_pct(median_gap) if pd.notna(median_gap) else "n/a")
+    st.caption(f"High-confidence overpay markets: {high_conf_count:,}")
+
+    if len(overpay_view):
+        overpay_view["Top Root Cause"] = overpay_view.apply(lambda r: top_root_cause_label(r, baselines), axis=1)
+        overpay_view["Recommendation 1"] = overpay_view.apply(lambda r: top_recommendation(r, baselines), axis=1)
+
+    map_col, queue_col = st.columns([1.45, 1.0])
+    with map_col:
+        st.markdown("### Opportunity map")
+        map_df = overpay_view.dropna(subset=["latitude", "longitude"]).copy()
+        if len(map_df):
+            color_max = float(map_df["Estimated Opportunity"].quantile(0.95)) if map_df["Estimated Opportunity"].notna().any() else 0.0
+            color_max = max(color_max, float(map_df["Estimated Opportunity"].max()), 1.0)
+            center_lat = float(map_df["latitude"].median())
+            center_lon = float(map_df["longitude"].median())
+            fig = px.scatter_map(
+                map_df,
+                lat="latitude",
+                lon="longitude",
+                color="Estimated Opportunity",
+                size="Estimated Opportunity",
+                size_max=26,
+                range_color=[0, color_max],
+                color_continuous_scale=["#BFD7EA", "#4F81BD", "#C8102E"],
+                hover_name="Market / Xdock",
+                hover_data={
+                    "Market Name": True,
+                    "Confidence": True,
+                    "Actual CPS": ":$.2f",
+                    "Expected CPS": ":$.2f",
+                    "Expected CPS CS Model": ":$.2f" if "Expected CPS CS Model" in map_df.columns else False,
+                    "Estimated Opportunity": ":$,.0f",
+                    "latitude": False,
+                    "longitude": False,
+                },
+                title="Overpay opportunity by xdock",
+                zoom=3.2,
+                center={"lat": center_lat, "lon": center_lon},
+            )
+            fig.update_traces(marker=dict(opacity=0.82, sizemode="area"))
+            fig.update_layout(
+                height=520,
+                margin=dict(l=0, r=0, t=48, b=0),
+                map=dict(style="open-street-map"),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Map is ready, but the app data does not yet include xdock latitude/longitude columns.")
+            st.caption("Your notebook geocodes query can be used once DESTINATION_LATITUDE and DESTINATION_LONGITUDE are merged into the exported app dataset.")
+
+    with queue_col:
+        st.markdown("### Priority queue")
+        if len(overpay_view):
+            queue_cols = existing_cols(
+                overpay_view,
+                [
+                    "Market / Xdock",
+                    "Confidence",
+                    "Estimated Opportunity",
+                    "CPS Gap vs Expected %",
+                    "Actual CPS",
+                    "Expected CPS",
+                    "Expected CPS CS Model",
+                    "Top Root Cause",
+                    "Recommendation 1",
+                ],
+            )
+            queue_df = overpay_view.sort_values(["Estimated Opportunity", "CPS Gap vs Expected %"], ascending=[False, False])[queue_cols].head(15)
+            st.dataframe(
+                queue_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Estimated Opportunity": st.column_config.NumberColumn(format="$%.0f"),
+                    "Actual CPS": st.column_config.NumberColumn(format="$%.2f"),
+                    "Expected CPS": st.column_config.NumberColumn(format="$%.2f"),
+                    "Expected CPS CS Model": st.column_config.NumberColumn(format="$%.2f"),
+                    "CPS Gap vs Expected %": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+        else:
+            st.info("No overpay candidates with the current filters.")
+
+    st.markdown("### Why these markets")
+    left_col, right_col = st.columns([1.0, 1.0])
+    with left_col:
+        if len(overpay_view):
+            root_cause_summary = (
+                overpay_view["Top Root Cause"]
+                .fillna("Unassigned")
+                .value_counts()
+                .rename_axis("Top Root Cause")
+                .reset_index(name="Markets")
+            )
+            fig_root = px.bar(
+                root_cause_summary.head(8),
+                x="Markets",
+                y="Top Root Cause",
+                orientation="h",
+                title="Top root causes across overpay markets",
+                color_discrete_sequence=[MCK_BRIGHT],
+            )
+            fig_root.update_layout(height=360, showlegend=False, yaxis_title="", xaxis_title="Markets")
+            st.plotly_chart(fig_root, use_container_width=True)
+        else:
+            st.info("Root-cause summary will appear when overpay markets are available.")
+    with right_col:
+        comparison_rows = baselines.get("model_comparison")
+        if comparison_rows:
+            comparison_df = pd.DataFrame(comparison_rows)
+            display_cols = existing_cols(comparison_df, ["Approach", "Model Status", "Feature Count", "MAE Cost", "Median Abs Error Cost", "R2 Log Target"])
+            st.dataframe(
+                comparison_df[display_cols],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "MAE Cost": st.column_config.NumberColumn(format="$%.2f"),
+                    "Median Abs Error Cost": st.column_config.NumberColumn(format="$%.2f"),
+                    "R2 Log Target": st.column_config.NumberColumn(format="%.3f"),
+                },
+            )
+        else:
+            st.info("Model comparison metrics are not available for this run.")
+
 # --------------------------------------------------------------------------- #
 # Loading and preparation
 # --------------------------------------------------------------------------- #
@@ -458,6 +663,20 @@ def build_scorecard(
     for c in group_cols:
         market[c] = market[c].astype(str)
 
+    cons_col = "median_cleansheet_cost_per_stop_conservative"
+    aggr_col = "median_cleansheet_cost_per_stop_aggressive"
+    if cons_col in market.columns and aggr_col in market.columns:
+        has_both_cleansheet = market[cons_col].notna() & market[aggr_col].notna()
+        market["cleansheet_mid_cost"] = np.where(
+            has_both_cleansheet,
+            (market[cons_col] + market[aggr_col]) / 2,
+            np.nan,
+        )
+        market["cleansheet_range_spread_pct"] = np.abs(safe_div(market[aggr_col], market[cons_col]) - 1)
+    else:
+        market["cleansheet_mid_cost"] = np.nan
+        market["cleansheet_range_spread_pct"] = np.nan
+
     # Model dataset.
     model_df = market[
         market["actual_median_cps"].notna()
@@ -495,38 +714,66 @@ def build_scorecard(
     metrics = {
         "groups_total": int(len(market)),
         "model_groups": int(len(model_df)),
-        "feature_count": int(len(feature_cols)),
-        "model_status": "model",
     }
 
-    if len(model_df) < 20 or len(feature_cols) == 0:
-        # Fallback: robust benchmark. Still gives a tool result instead of failing.
-        p50 = model_df["actual_median_cps"].median() if len(model_df) else market["actual_median_cps"].median()
-        p10 = model_df["actual_median_cps"].quantile(0.10) if len(model_df) else market["actual_median_cps"].quantile(0.10)
-        p90 = model_df["actual_median_cps"].quantile(0.90) if len(model_df) else market["actual_median_cps"].quantile(0.90)
-        market["pred_p10"] = p10
-        market["pred_p50"] = p50
-        market["pred_p90"] = p90
-        if use_p25_p75:
-            market["pred_p25"] = model_df["actual_median_cps"].quantile(0.25)
-            market["pred_p75"] = model_df["actual_median_cps"].quantile(0.75)
-        else:
-            market["pred_p25"] = np.nan
-            market["pred_p75"] = np.nan
-        metrics["model_status"] = "fallback benchmark"
-        metrics["mae_cost"] = np.nan
-        metrics["median_abs_error_cost"] = np.nan
-        metrics["r2_log_target"] = np.nan
-    else:
-        X = model_df[feature_cols].copy()
+    quantiles = [0.10, 0.50, 0.90] if not use_p25_p75 else [0.10, 0.25, 0.50, 0.75, 0.90]
+    score_eligible = market["actual_median_cps"].notna() & (market["actual_median_cps"] > 0)
+
+    if len(model_df):
         y = np.log1p(model_df["actual_median_cps"].astype(float))
         weights = np.sqrt(model_df["paid_records"].clip(lower=1).astype(float))
+        train_idx, test_idx = train_test_split(model_df.index.to_numpy(), test_size=0.20, random_state=random_state)
+    else:
+        y = pd.Series(dtype=float)
+        weights = pd.Series(dtype=float)
+        train_idx = np.array([], dtype=int)
+        test_idx = np.array([], dtype=int)
 
-        X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
-            X, y, weights, test_size=0.20, random_state=random_state
-        )
+    def fit_expected_cost_variant(
+        approach_name: str,
+        score_prefix: str,
+        numeric_variant_features: list[str],
+        categorical_variant_features: list[str],
+        uses_cleansheet_midpoint: bool,
+    ) -> dict:
+        variant_feature_cols = numeric_variant_features + categorical_variant_features
+        variant_metrics = {
+            "Approach": approach_name,
+            "Model Status": "model",
+            "Feature Count": int(len(variant_feature_cols)),
+            "Model Groups": int(len(model_df)),
+            "Uses Cleansheet Midpoint": uses_cleansheet_midpoint,
+            "Quantiles": ", ".join(f"P{int(q * 100):02d}" for q in quantiles),
+            "MAE Cost": np.nan,
+            "Median Abs Error Cost": np.nan,
+            "R2 Log Target": np.nan,
+        }
 
-        def make_preprocessor():
+        qcols = [f"{score_prefix}_p{int(q * 100):02d}" for q in quantiles]
+        fallback_p50 = model_df["actual_median_cps"].median() if len(model_df) else market["actual_median_cps"].median()
+        fallback_p10 = model_df["actual_median_cps"].quantile(0.10) if len(model_df) else market["actual_median_cps"].quantile(0.10)
+        fallback_p90 = model_df["actual_median_cps"].quantile(0.90) if len(model_df) else market["actual_median_cps"].quantile(0.90)
+        fallback_p25 = model_df["actual_median_cps"].quantile(0.25) if len(model_df) else market["actual_median_cps"].quantile(0.25)
+        fallback_p75 = model_df["actual_median_cps"].quantile(0.75) if len(model_df) else market["actual_median_cps"].quantile(0.75)
+
+        if len(model_df) < 20 or len(variant_feature_cols) == 0:
+            variant_metrics["Model Status"] = "fallback benchmark"
+            for q in quantiles:
+                col = f"{score_prefix}_p{int(q * 100):02d}"
+                if q == 0.10:
+                    market[col] = fallback_p10
+                elif q == 0.25:
+                    market[col] = fallback_p25
+                elif q == 0.50:
+                    market[col] = fallback_p50
+                elif q == 0.75:
+                    market[col] = fallback_p75
+                else:
+                    market[col] = fallback_p90
+            market[qcols] = np.sort(market[qcols].to_numpy(), axis=1)
+            return variant_metrics
+
+        def make_preprocessor() -> ColumnTransformer:
             num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median"))])
             cat_pipe = Pipeline(
                 [
@@ -535,11 +782,11 @@ def build_scorecard(
                 ]
             )
             return ColumnTransformer(
-                [("num", num_pipe, numeric_features), ("cat", cat_pipe, categorical_features)],
+                [("num", num_pipe, numeric_variant_features), ("cat", cat_pipe, categorical_variant_features)],
                 remainder="drop",
             )
 
-        def make_model(q: float):
+        def make_model(q: float) -> Pipeline:
             return Pipeline(
                 [
                     ("prep", make_preprocessor()),
@@ -558,59 +805,81 @@ def build_scorecard(
                 ]
             )
 
-        quantiles = [0.10, 0.50, 0.90] if not use_p25_p75 else [0.10, 0.25, 0.50, 0.75, 0.90]
+        X_train = model_df.loc[train_idx, variant_feature_cols].copy()
+        X_test = model_df.loc[test_idx, variant_feature_cols].copy()
+        y_train = y.loc[train_idx]
+        y_test = y.loc[test_idx]
+        w_train = weights.loc[train_idx]
+
         models = {}
         for q in quantiles:
-            m = make_model(q)
-            m.fit(X_train, y_train, model__sample_weight=w_train)
-            models[q] = m
+            model = make_model(q)
+            model.fit(X_train, y_train, model__sample_weight=w_train)
+            models[q] = model
 
         pred_test = np.expm1(models[0.50].predict(X_test)).clip(min=0)
         y_test_cost = np.expm1(y_test)
-        metrics.update(
+        variant_metrics.update(
             {
-                "quantiles": str(quantiles),
-                "mae_cost": float(mean_absolute_error(y_test_cost, pred_test)),
-                "median_abs_error_cost": float(median_absolute_error(y_test_cost, pred_test)),
-                "r2_log_target": float(r2_score(y_test, models[0.50].predict(X_test))),
+                "MAE Cost": float(mean_absolute_error(y_test_cost, pred_test)),
+                "Median Abs Error Cost": float(median_absolute_error(y_test_cost, pred_test)),
+                "R2 Log Target": float(r2_score(y_test, models[0.50].predict(X_test))),
             }
         )
 
-        score_eligible = market["actual_median_cps"].notna() & (market["actual_median_cps"] > 0)
-        for q, m in models.items():
-            col = f"pred_p{int(q * 100):02d}"
+        for q, model in models.items():
+            col = f"{score_prefix}_p{int(q * 100):02d}"
             market[col] = np.nan
-            market.loc[score_eligible, col] = np.expm1(m.predict(market.loc[score_eligible, feature_cols])).clip(min=0)
-        if "pred_p25" not in market.columns:
-            market["pred_p25"] = np.nan
-        if "pred_p75" not in market.columns:
-            market["pred_p75"] = np.nan
-        qcols = ["pred_p10", "pred_p25", "pred_p50", "pred_p75", "pred_p90"] if use_p25_p75 else ["pred_p10", "pred_p50", "pred_p90"]
+            market.loc[score_eligible, col] = np.expm1(
+                model.predict(market.loc[score_eligible, variant_feature_cols])
+            ).clip(min=0)
         market[qcols] = np.sort(market[qcols].to_numpy(), axis=1)
+        return variant_metrics
+
+    baseline_metrics = fit_expected_cost_variant(
+        approach_name="Baseline model",
+        score_prefix="pred",
+        numeric_variant_features=numeric_features,
+        categorical_variant_features=categorical_features,
+        uses_cleansheet_midpoint=False,
+    )
+
+    challenger_numeric_features = list(numeric_features)
+    challenger_available = "cleansheet_mid_cost" in model_df.columns and model_df["cleansheet_mid_cost"].notna().any()
+    if challenger_available:
+        challenger_numeric_features.append("cleansheet_mid_cost")
+
+    challenger_metrics = fit_expected_cost_variant(
+        approach_name="CS model",
+        score_prefix="alt_pred",
+        numeric_variant_features=challenger_numeric_features,
+        categorical_variant_features=categorical_features,
+        uses_cleansheet_midpoint=challenger_available,
+    )
+    if not challenger_available:
+        challenger_metrics["Model Status"] = "not available"
+
+    metrics.update(
+        {
+            "feature_count": baseline_metrics["Feature Count"],
+            "model_status": baseline_metrics["Model Status"],
+            "quantiles": baseline_metrics["Quantiles"],
+            "mae_cost": baseline_metrics["MAE Cost"],
+            "median_abs_error_cost": baseline_metrics["Median Abs Error Cost"],
+            "r2_log_target": baseline_metrics["R2 Log Target"],
+            "model_comparison": [baseline_metrics, challenger_metrics],
+        }
+    )
 
     market["model_residual"] = market["actual_median_cps"] - market["pred_p50"]
     market["model_residual_pct"] = safe_div(market["actual_median_cps"], market["pred_p50"]) - 1
     market["normalization_sensitivity_pct"] = safe_div(market.get("median_normalized_cost", np.nan), market["actual_median_cps"]) - 1
     market["norm_sensitivity_abs_pct"] = np.abs(market["normalization_sensitivity_pct"])
 
-    cons_col = "median_cleansheet_cost_per_stop_conservative"
-    aggr_col = "median_cleansheet_cost_per_stop_aggressive"
     market["cleansheet_cons_gap_pct"] = safe_div(market["actual_median_cps"], market[cons_col]) - 1 if cons_col in market.columns else np.nan
     market["cleansheet_aggr_gap_pct"] = safe_div(market["actual_median_cps"], market[aggr_col]) - 1 if aggr_col in market.columns else np.nan
 
     # Cleansheet sensitivity mirrors normalized-cost sensitivity: compare benchmark cost to actual CPS.
-    if cons_col in market.columns and aggr_col in market.columns:
-        has_both_cleansheet = market[cons_col].notna() & market[aggr_col].notna()
-        market["cleansheet_mid_cost"] = np.where(
-            has_both_cleansheet,
-            (market[cons_col] + market[aggr_col]) / 2,
-            np.nan,
-        )
-        market["cleansheet_range_spread_pct"] = np.abs(safe_div(market[aggr_col], market[cons_col]) - 1)
-    else:
-        market["cleansheet_mid_cost"] = np.nan
-        market["cleansheet_range_spread_pct"] = np.nan
-
     market["cleansheet_sensitivity_pct"] = safe_div(market["cleansheet_mid_cost"], market["actual_median_cps"]) - 1
     market["cleansheet_sensitivity_abs_pct"] = np.abs(market["cleansheet_sensitivity_pct"])
     market["combined_sensitivity_abs_pct"] = market[["norm_sensitivity_abs_pct", "cleansheet_sensitivity_abs_pct"]].mean(axis=1, skipna=True)
@@ -727,6 +996,7 @@ def build_scorecard(
     market["Market Name"] = market["Market / Xdock"].map(market_name)
     market["Actual CPS"] = market["actual_median_cps"]
     market["Expected CPS"] = market["pred_p50"]
+    market["Expected CPS CS Model"] = market["alt_pred_p50"] if "alt_pred_p50" in market.columns else np.nan
     market["Expected Low CPS P10"] = market["pred_p10"]
     market["Expected High CPS P90"] = market["pred_p90"]
     market["CPS Gap vs Expected"] = market["model_residual"]
@@ -1842,6 +2112,10 @@ for col in [
         rca_baselines[col] = business_view[col].median(skipna=True)
 
 RECOMMENDER_MODEL_PACK = train_recommendation_agent(business_view, rca_baselines)
+executive_geo_view = build_xdock_geo_view(filtered, business_view)
+executive_context = dict(rca_baselines)
+if isinstance(model_metrics, dict):
+    executive_context["model_comparison"] = model_metrics.get("model_comparison")
 
 with st.expander("Quick interpretation", expanded=False):
     st.markdown(
@@ -1854,7 +2128,10 @@ with st.expander("Quick interpretation", expanded=False):
 # --------------------------------------------------------------------------- #
 # Market investigation tool
 # --------------------------------------------------------------------------- #
-top_market_tab, top_reco_tab, top_business_tab = st.tabs(["Market investigation", "Recommendation agent", "Business views"])
+top_exec_tab, top_market_tab, top_reco_tab, top_business_tab = st.tabs(["Executive view", "Market investigation", "Recommendation agent", "Business views"])
+
+with top_exec_tab:
+    render_executive_view(executive_geo_view, executive_context)
 
 with top_market_tab:
     st.subheader("Market investigation")
@@ -2301,11 +2578,55 @@ The recommender agent is a hybrid layer that ranks actions after the market is c
 
     st.subheader("Current Model Statistics")
 
-    st.dataframe(
-        pd.DataFrame([model_metrics]),
-        use_container_width=True,
-        hide_index=True,
-    )
+    comparison_rows = model_metrics.get("model_comparison") if isinstance(model_metrics, dict) else None
+    if comparison_rows:
+        comparison_df = pd.DataFrame(comparison_rows)
+        baseline_row = comparison_df.iloc[0]
+        challenger_row = comparison_df.iloc[1] if len(comparison_df) > 1 else None
+
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            delta_text = None
+            if challenger_row is not None and pd.notna(challenger_row.get("MAE Cost")) and pd.notna(baseline_row.get("MAE Cost")):
+                delta_text = f"{challenger_row['MAE Cost'] - baseline_row['MAE Cost']:+.2f} vs baseline"
+            st.metric("CS Model MAE", money(challenger_row.get("MAE Cost")) if challenger_row is not None else "n/a", delta=delta_text)
+        with m2:
+            delta_text = None
+            if challenger_row is not None and pd.notna(challenger_row.get("Median Abs Error Cost")) and pd.notna(baseline_row.get("Median Abs Error Cost")):
+                delta_text = f"{challenger_row['Median Abs Error Cost'] - baseline_row['Median Abs Error Cost']:+.2f} vs baseline"
+            st.metric(
+                "CS Model Median Error",
+                money(challenger_row.get("Median Abs Error Cost")) if challenger_row is not None else "n/a",
+                delta=delta_text,
+            )
+        with m3:
+            delta_text = None
+            if challenger_row is not None and pd.notna(challenger_row.get("R2 Log Target")) and pd.notna(baseline_row.get("R2 Log Target")):
+                delta_text = f"{challenger_row['R2 Log Target'] - baseline_row['R2 Log Target']:+.3f} vs baseline"
+            st.metric(
+                "CS Model R2",
+                f"{challenger_row.get('R2 Log Target'):.3f}" if challenger_row is not None and pd.notna(challenger_row.get("R2 Log Target")) else "n/a",
+                delta=delta_text,
+            )
+
+        st.caption("Baseline model remains the production Expected CPS signal. The CS model adds the average of conservative and aggressive cleansheet as an extra feature and is scored on the same train/test split for comparison.")
+
+        st.dataframe(
+            comparison_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "MAE Cost": st.column_config.NumberColumn(format="$%.2f"),
+                "Median Abs Error Cost": st.column_config.NumberColumn(format="$%.2f"),
+                "R2 Log Target": st.column_config.NumberColumn(format="%.3f"),
+            },
+        )
+    else:
+        st.dataframe(
+            pd.DataFrame([model_metrics]),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 with top_reco_tab:
     st.subheader("Recommender agent")
