@@ -334,13 +334,24 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
     with queue_col:
         st.markdown("### Priority queue")
         if len(overpay_view):
+            overpay_view["Gap Visual"] = (100.0 * overpay_view["CPS Gap vs Expected %"].fillna(0)).clip(lower=0)
+            conf_map = {"Very Low": 0, "Low": 1, "Medium": 2, "High": 3}
+            overpay_view["Confidence Visual"] = overpay_view["Confidence"].map(conf_map).fillna(0)
+            overpay_view["Opportunity Visual"] = overpay_view["Estimated Opportunity"].fillna(0)
+            opp_max = float(overpay_view["Opportunity Visual"].max()) if len(overpay_view) else 0.0
+            if opp_max > 0:
+                overpay_view["Opportunity Visual"] = (100.0 * overpay_view["Opportunity Visual"] / opp_max).clip(0, 100)
+
             queue_cols = existing_cols(
                 overpay_view,
                 [
                     "Market / Xdock",
                     "Confidence",
+                    "Confidence Visual",
                     "Estimated Opportunity",
+                    "Opportunity Visual",
                     "CPS Gap vs Expected %",
+                    "Gap Visual",
                     "Actual CPS",
                     "Expected CPS",
                     "Expected CPS CS Model",
@@ -355,10 +366,13 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
                 hide_index=True,
                 column_config={
                     "Estimated Opportunity": st.column_config.NumberColumn(format="$%.0f"),
+                    "Opportunity Visual": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
                     "Actual CPS": st.column_config.NumberColumn(format="$%.2f"),
                     "Expected CPS": st.column_config.NumberColumn(format="$%.2f"),
                     "Expected CPS CS Model": st.column_config.NumberColumn(format="$%.2f"),
                     "CPS Gap vs Expected %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Gap Visual": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
+                    "Confidence Visual": st.column_config.ProgressColumn(min_value=0, max_value=3, format="%.0f"),
                 },
             )
         else:
@@ -403,7 +417,34 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
                 },
             )
         else:
-            st.info("Model comparison metrics are not available for this run.")
+            fallback_metrics = baselines.get("model_metrics")
+            if isinstance(fallback_metrics, dict):
+                fallback_df = pd.DataFrame(
+                    [
+                        {
+                            "Approach": "Baseline model",
+                            "Model Status": fallback_metrics.get("model_status", "model"),
+                            "Feature Count": fallback_metrics.get("feature_count"),
+                            "MAE Cost": fallback_metrics.get("mae_cost"),
+                            "Median Abs Error Cost": fallback_metrics.get("median_abs_error_cost"),
+                            "R2 Log Target": fallback_metrics.get("r2_log_target"),
+                        }
+                    ]
+                )
+                display_cols = existing_cols(fallback_df, ["Approach", "Model Status", "Feature Count", "MAE Cost", "Median Abs Error Cost", "R2 Log Target"])
+                st.dataframe(
+                    fallback_df[display_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "MAE Cost": st.column_config.NumberColumn(format="$%.2f"),
+                        "Median Abs Error Cost": st.column_config.NumberColumn(format="$%.2f"),
+                        "R2 Log Target": st.column_config.NumberColumn(format="%.3f"),
+                    },
+                )
+                st.caption("CS model comparison is not present in this artifact. Showing baseline model metrics.")
+            else:
+                st.info("Model comparison metrics are not available for this run.")
 
 # --------------------------------------------------------------------------- #
 # Loading and preparation
@@ -1527,6 +1568,35 @@ def render_recommendation_detail_body(row: pd.Series, baselines: dict[str, float
     )
     st.markdown(f"- Top root cause: {root_cause_summary(row, baselines)}")
 
+    bench_rows = [
+        {"Metric": "Actual", "Value": row.get("Actual CPS", np.nan)},
+        {"Metric": "Expected", "Value": row.get("Expected CPS", np.nan)},
+        {"Metric": "Normalized", "Value": row.get("Normalized Cost", np.nan)},
+        {"Metric": "CS Agg", "Value": row.get("Cleansheet Aggressive", np.nan)},
+    ]
+    if "Expected CPS CS Model" in row.index:
+        bench_rows.append({"Metric": "CS Model", "Value": row.get("Expected CPS CS Model", np.nan)})
+    bench_df = pd.DataFrame(bench_rows)
+    bench_df["Value"] = pd.to_numeric(bench_df["Value"], errors="coerce")
+    bench_df = bench_df.dropna(subset=["Value"])
+    if len(bench_df) >= 2:
+        fig_bench = px.bar(
+            bench_df,
+            x="Value",
+            y="Metric",
+            orientation="h",
+            color="Metric",
+            color_discrete_sequence=["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728", "#9467bd"],
+        )
+        fig_bench.update_layout(
+            showlegend=False,
+            height=220,
+            margin=dict(l=0, r=0, t=0, b=0),
+            xaxis_title=None,
+            yaxis_title=None,
+        )
+        st.plotly_chart(fig_bench, use_container_width=True)
+
     if ranked:
         display_rows = []
         for idx, action in enumerate(ranked[:5], start=1):
@@ -2121,6 +2191,7 @@ executive_geo_view = build_xdock_geo_view(filtered, business_view)
 executive_context = dict(rca_baselines)
 if isinstance(model_metrics, dict):
     executive_context["model_comparison"] = model_metrics.get("model_comparison")
+    executive_context["model_metrics"] = model_metrics
 
 with st.expander("Quick interpretation", expanded=False):
     st.markdown(
@@ -2653,6 +2724,9 @@ with top_reco_tab:
         overpay_queue["Recommendation 2"] = overpay_queue.apply(lambda r: second_recommendation(r, rca_baselines), axis=1)
         overpay_queue["Action 2 Impact"] = overpay_queue.apply(lambda r: second_action_impact(r, rca_baselines), axis=1)
         overpay_queue["Action 2 Confidence"] = overpay_queue.apply(lambda r: second_action_confidence(r, rca_baselines), axis=1)
+        overpay_queue["Gap Visual"] = (100.0 * overpay_queue["CPS Gap vs Expected %"].fillna(0)).clip(lower=0)
+        conf_map = {"Very Low": 0, "Low": 1, "Medium": 2, "High": 3}
+        overpay_queue["Confidence Visual"] = overpay_queue["Confidence"].map(conf_map).fillna(0)
 
         st.markdown("### Overpay queue (Expected CPS gap driven)")
         queue_cols = existing_cols(
@@ -2660,7 +2734,9 @@ with top_reco_tab:
             [
                 "Market / Xdock",
                 "Confidence",
+                "Confidence Visual",
                 "CPS Gap vs Expected %",
+                "Gap Visual",
                 "Actual CPS",
                 "Expected CPS",
                 "Normalized Cost",
@@ -2681,6 +2757,9 @@ with top_reco_tab:
 
         overpay_market_options = overpay_queue["Market / Xdock"].astype(str).tolist()
         if overpay_market_options:
+            pending_overpay_picker = st.session_state.pop("overpay_picker_pending", None)
+            if pending_overpay_picker in overpay_market_options:
+                st.session_state["overpay_picker"] = pending_overpay_picker
             if "overpay_picker" not in st.session_state:
                 st.session_state["overpay_picker"] = overpay_market_options[0]
             if st.session_state.get("overpay_picker") not in overpay_market_options:
@@ -2708,6 +2787,15 @@ with top_reco_tab:
                 on_select="rerun",
                 selection_mode="single-row",
                 key="overpay_queue_table",
+                column_config={
+                    "Actual CPS": st.column_config.NumberColumn(format="$%.2f"),
+                    "Expected CPS": st.column_config.NumberColumn(format="$%.2f"),
+                    "Normalized Cost": st.column_config.NumberColumn(format="$%.2f"),
+                    "Cleansheet Aggressive": st.column_config.NumberColumn(format="$%.2f"),
+                    "CPS Gap vs Expected %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Gap Visual": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
+                    "Confidence Visual": st.column_config.ProgressColumn(min_value=0, max_value=3, format="%.0f"),
+                },
             )
             selected_rows = selected_rows_from_event(overpay_event)
             if selected_rows:
@@ -2767,7 +2855,8 @@ with top_reco_tab:
 
         # sync row-click selection to picker for next rerun
         if overpay_market_options and selected_from_overpay_queue and selected_from_overpay_queue in overpay_market_options:
-            st.session_state["overpay_picker"] = selected_from_overpay_queue
+            if st.session_state.get("overpay_picker") != selected_from_overpay_queue:
+                st.session_state["overpay_picker_pending"] = selected_from_overpay_queue
     else:
         st.info("No overpay candidates with the current filters.")
 
@@ -2822,6 +2911,9 @@ with top_reco_tab:
 
         strict_market_options = strict_overpay_queue["Market / Xdock"].astype(str).tolist()
         if strict_market_options:
+            pending_strict_picker = st.session_state.pop("strict_overpay_picker_pending", None)
+            if pending_strict_picker in strict_market_options:
+                st.session_state["strict_overpay_picker"] = pending_strict_picker
             if "strict_overpay_picker" not in st.session_state:
                 st.session_state["strict_overpay_picker"] = strict_market_options[0]
             if st.session_state.get("strict_overpay_picker") not in strict_market_options:
@@ -2908,7 +3000,8 @@ with top_reco_tab:
 
         # sync row-click selection to picker for next rerun
         if strict_market_options and selected_from_queue and selected_from_queue in strict_market_options:
-            st.session_state["strict_overpay_picker"] = selected_from_queue
+            if st.session_state.get("strict_overpay_picker") != selected_from_queue:
+                st.session_state["strict_overpay_picker_pending"] = selected_from_queue
     else:
         st.info("No xdock meets the strict all-3-reference-cost condition with the current filters.")
 
