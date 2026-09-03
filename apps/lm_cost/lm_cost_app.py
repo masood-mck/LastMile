@@ -293,6 +293,18 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
             color_max = max(color_max, float(map_df["Estimated Opportunity"].max()), 1.0)
             center_lat = float(map_df["latitude"].median())
             center_lon = float(map_df["longitude"].median())
+            map_hover_data = {
+                "Confidence": True,
+                "Actual CPS": ":$.2f",
+                "Expected CPS": ":$.2f",
+                "Estimated Opportunity": ":$,.0f",
+                "latitude": False,
+                "longitude": False,
+            }
+            if "Market Name" in map_df.columns:
+                map_hover_data["Market Name"] = True
+            if "Expected CPS CS Model" in map_df.columns:
+                map_hover_data["Expected CPS CS Model"] = ":$.2f"
             fig = px.scatter_map(
                 map_df,
                 lat="latitude",
@@ -303,16 +315,7 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
                 range_color=[0, color_max],
                 color_continuous_scale=["#BFD7EA", "#4F81BD", "#C8102E"],
                 hover_name="Market / Xdock",
-                hover_data={
-                    "Market Name": True,
-                    "Confidence": True,
-                    "Actual CPS": ":$.2f",
-                    "Expected CPS": ":$.2f",
-                    "Expected CPS CS Model": ":$.2f" if "Expected CPS CS Model" in map_df.columns else False,
-                    "Estimated Opportunity": ":$,.0f",
-                    "latitude": False,
-                    "longitude": False,
-                },
+                hover_data=map_hover_data,
                 title="Overpay opportunity by xdock",
                 zoom=3.2,
                 center={"lat": center_lat, "lon": center_lon},
