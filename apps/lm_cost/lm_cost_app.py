@@ -1703,13 +1703,20 @@ def _popup_raw_records(row: pd.Series, raw_df: pd.DataFrame | None) -> pd.DataFr
         return pd.DataFrame()
 
     records = raw_df.copy()
-    selected_market = str(row.get("Market / Xdock", "")).strip()
+    selected_market = str(row.get("Market / Xdock", "")).strip().upper()
     if selected_market and "XDOCK" in records.columns:
-        records = records[records["XDOCK"].astype(str).eq(selected_market)]
+        xdock_norm = records["XDOCK"].astype(str).str.strip().str.upper()
+        records = records[xdock_norm.eq(selected_market)]
 
     selected_carrier = str(row.get("Carrier", "")).strip()
     if selected_carrier and selected_carrier not in {"All carriers", "n/a"} and "CARRIER_SCAC_CD" in records.columns:
-        records = records[records["CARRIER_SCAC_CD"].astype(str).eq(selected_carrier)]
+        carrier_norm = records["CARRIER_SCAC_CD"].astype(str).str.strip().str.upper()
+        records = records[carrier_norm.eq(selected_carrier.upper())]
+
+    # If filtering produced no rows, return market-level rows as a fallback.
+    if records.empty and selected_market and "XDOCK" in raw_df.columns:
+        raw_xdock_norm = raw_df["XDOCK"].astype(str).str.strip().str.upper()
+        records = raw_df[raw_xdock_norm.eq(selected_market)].copy()
 
     return records
 
@@ -1741,20 +1748,33 @@ def render_recommendation_detail_body(row: pd.Series, baselines: dict[str, float
     bench_df["Value"] = pd.to_numeric(bench_df["Value"], errors="coerce")
     bench_df = bench_df.dropna(subset=["Value"])
     if len(bench_df) >= 2:
+        bench_order = ["Actual", "Expected", "Normalized", "CS Agg", "CS Model"]
+        bench_df["Metric"] = pd.Categorical(bench_df["Metric"], categories=bench_order, ordered=True)
+        bench_df = bench_df.sort_values("Metric")
         fig_bench = px.bar(
             bench_df,
             x="Value",
             y="Metric",
             orientation="h",
             color="Metric",
-            color_discrete_sequence=["#1f77b4", "#2ca02c", "#ff7f0e", "#d62728", "#9467bd"],
+            color_discrete_map={
+                "Actual": "#C8102E",
+                "Expected": "#5B7FA6",
+                "Normalized": "#7AA6C2",
+                "CS Agg": "#9EB7C9",
+                "CS Model": "#B9CADA",
+            },
         )
+        fig_bench.update_traces(texttemplate="$%{x:,.2f}", textposition="outside", cliponaxis=False)
         fig_bench.update_layout(
             showlegend=False,
-            height=220,
-            margin=dict(l=0, r=0, t=0, b=0),
-            xaxis_title=None,
+            height=170,
+            margin=dict(l=0, r=0, t=4, b=0),
+            xaxis_title="CPS ($)",
             yaxis_title=None,
+            xaxis=dict(showgrid=True, gridcolor="#E6EAF0", zeroline=False),
+            yaxis=dict(categoryorder="array", categoryarray=bench_order),
+            plot_bgcolor="#FFFFFF",
         )
         st.plotly_chart(fig_bench, use_container_width=True)
 
@@ -1922,155 +1942,52 @@ def train_recommendation_agent(df: pd.DataFrame, baselines: dict[str, float], ra
     train_df["Confidence Score"] = train_df.apply(recommendation_confidence_score, axis=1)
     feature_cols = recommendation_feature_columns(train_df)
     if len(train_df) < 40 or len(feature_cols) < 6:
+                            raw_df=filtered,
         uniform_priors = {action: 1.0 / len(RECOMMENDATION_ACTIONS) for action in RECOMMENDATION_ACTIONS}
         return {
             "status": "fallback",
             "model": None,
-            "feature_cols": feature_cols,
+    # Render map independently from table selection.
             "action_priors": uniform_priors,
             "metrics": {
                 "training_rows": int(len(train_df)),
                 "feature_count": int(len(feature_cols)),
-                "model_status": "fallback rules-only",
-            },
-        }
+            map_data_all = map_df.copy()
+            color_max = float(map_data_all["Estimated Opportunity"].fillna(0).max()) if map_data_all["Estimated Opportunity"].notna().any() else 1.0
+            center_lat = float(map_data_all["latitude"].median())
+            center_lon = float(map_data_all["longitude"].median())
 
-    labeled_df = train_df.copy()
-    labeled_df["Agent Top Action"] = labeled_df.apply(
-        lambda r: ranked_recommendations(r, baselines, use_hybrid=False)[0]["Action"],
-        axis=1,
-    )
-    action_counts_full = labeled_df["Agent Top Action"].value_counts(normalize=True)
-    action_priors = {action: float(action_counts_full.get(action, 0.0)) for action in RECOMMENDATION_ACTIONS}
-    if sum(action_priors.values()) <= 0:
-        action_priors = {action: 1.0 / len(RECOMMENDATION_ACTIONS) for action in RECOMMENDATION_ACTIONS}
+            fig = px.scatter_map(
+                map_data_all,
+                lat="latitude",
+                lon="longitude",
+                color="Estimated Opportunity",
+                size="Estimated Opportunity",
+                size_max=26,
+                range_color=[0, color_max],
+                color_continuous_scale=["#BFD7EA", "#4F81BD", "#C8102E"],
+                hover_name="Market / Xdock",
+                hover_data={
+                    "Confidence": True,
+                    "Actual CPS": ":$.2f",
+                    "Expected CPS": ":$.2f",
+                    "Estimated Opportunity": ":$,.0f",
+                    "latitude": False,
+                    "longitude": False,
+                } | ({"Market Name": True} if "Market Name" in map_data_all.columns else {}) | ({"Expected CPS CS Model": ":$.2f"} if "Expected CPS CS Model" in map_data_all.columns else {}),
+                title="Overpay opportunity by xdock",
+            )
+            fig.update_traces(marker=dict(opacity=0.82, sizemode="area"))
+            fig.update_layout(
+                height=520,
+                margin=dict(l=0, r=0, t=48, b=0),
+                map=dict(
+                    style="open-street-map",
+                    zoom=3.2,
+                    center=dict(lat=center_lat, lon=center_lon),
+                ),
+            )
 
-    action_counts = labeled_df["Agent Top Action"].value_counts()
-    if action_counts.nunique() == 0 or action_counts.min() < 2 or action_counts.shape[0] < 2:
-        return {
-            "status": "fallback",
-            "model": None,
-            "feature_cols": feature_cols,
-            "action_priors": action_priors,
-            "metrics": {
-                "training_rows": int(len(train_df)),
-                "feature_count": int(len(feature_cols)),
-                "model_status": "fallback insufficient action labels",
-            },
-        }
-
-    X = labeled_df[feature_cols].copy()
-    y = labeled_df["Agent Top Action"].astype(str).copy()
-    stratify = y if y.nunique() > 1 and y.value_counts().min() >= 2 else None
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.20,
-        random_state=random_state,
-        stratify=stratify,
-    )
-
-    lr_common_kwargs = {
-        "max_iter": 2000,
-        "class_weight": "balanced",
-        "random_state": random_state,
-    }
-    try:
-        lr_model = LogisticRegression(multi_class="multinomial", **lr_common_kwargs)
-    except TypeError:
-        # Some sklearn builds do not accept multi_class; rely on estimator defaults.
-        lr_model = LogisticRegression(**lr_common_kwargs)
-
-    pipe = Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("model", lr_model),
-        ]
-    )
-    pipe.fit(X_train, y_train)
-
-    y_pred = pipe.predict(X_test)
-    metrics = {
-        "training_rows": int(len(labeled_df)),
-        "feature_count": int(len(feature_cols)),
-        "action_classes": int(y.nunique()),
-        "accuracy": float(accuracy_score(y_test, y_pred)),
-        "macro_f1": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
-        "model_status": "hybrid model",
-    }
-
-    return {
-        "status": "hybrid model",
-        "model": pipe,
-        "feature_cols": feature_cols,
-        "action_priors": action_priors,
-        "metrics": metrics,
-    }
-
-# --------------------------------------------------------------------------- #
-# Styling
-# --------------------------------------------------------------------------- #
-st.markdown(
-    f"""
-    <style>
-      .block-container {{ padding-top: 1.1rem; padding-bottom: 1rem; }}
-      header[data-testid="stHeader"] {{ height: 0; background: transparent; }}
-            section[data-testid="stSidebar"] {{
-                background: {MCK_NAVY};
-                border-right: 1px solid rgba(255, 255, 255, 0.18);
-            }}
-            section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {{
-                padding-top: .35rem;
-            }}
-            .logo-wrap {{
-                background:#FFFFFF;
-                border-radius:10px;
-                padding:12px 14px;
-                margin:.2rem 0 .8rem 0;
-                text-align:left;
-            }}
-            .logo-wrap img {{
-                width:148px;
-                height:auto;
-                display:block;
-            }}
-            section[data-testid="stSidebar"] h1,
-            section[data-testid="stSidebar"] h2,
-            section[data-testid="stSidebar"] h3,
-            section[data-testid="stSidebar"] label,
-            section[data-testid="stSidebar"] p,
-            section[data-testid="stSidebar"] span,
-            section[data-testid="stSidebar"] div {{
-                color: #FFFFFF;
-            }}
-            section[data-testid="stSidebar"] div[data-testid="stMultiSelect"] {{
-                background: transparent !important;
-            }}
-            section[data-testid="stSidebar"] div[data-baseweb="select"] > div {{
-                background: rgba(255, 255, 255, 0.08) !important;
-                color: #FFFFFF !important;
-                border-color: rgba(255, 255, 255, 0.24) !important;
-            }}
-            section[data-testid="stSidebar"] div[data-baseweb="select"] input {{
-                color: #FFFFFF !important;
-            }}
-            section[data-testid="stSidebar"] div[data-baseweb="tag"] {{
-                background: rgba(255, 255, 255, 0.14) !important;
-                color: #FFFFFF !important;
-                border: 1px solid rgba(255, 255, 255, 0.22) !important;
-            }}
-            section[data-testid="stSidebar"] div[data-baseweb="popover"] {{
-                background: #FFFFFF !important;
-                color: {MCK_NAVY} !important;
-            }}
-            section[data-testid="stSidebar"] hr {{
-                border-color: rgba(255, 255, 255, 0.22);
-            }}
-      .app-title {{ font-size: 2.05rem; font-weight: 850; color: {MCK_BLUE}; margin: 0 0 .15rem 0; }}
-      .app-rule {{ height: 3px; width: 72px; background: {MCK_GREEN}; border-radius: 2px; margin: 0 0 .8rem 0; }}
-      .tool-note {{ background: #F7FAFD; border-left: 5px solid {MCK_BRIGHT}; padding: .85rem 1rem; border-radius: 6px; margin: .6rem 0; }}
-      .kpi-row {{ display: flex; gap: .6rem; margin: .4rem 0 1rem 0; }}
       .kpi {{ flex: 1; background: {MCK_LIGHT}; border: 1px solid #E2E8F0; border-radius: 10px; padding: .6rem .8rem; }}
       .kpi .lbl {{ font-size: .68rem; text-transform: uppercase; letter-spacing: .45px; color: #68717A; white-space: nowrap; }}
       .kpi .val {{ font-size: 1.18rem; font-weight: 800; color: {MCK_BLUE}; line-height: 1.25; }}
