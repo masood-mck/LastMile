@@ -455,11 +455,11 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
                     fig.update_layout(
                         height=520,
                         margin=dict(l=0, r=0, t=48, b=0),
-                    )
-                    fig.update_mapboxes(
-                        style="open-street-map",
-                        zoom=6.5,
-                        center={"lat": zoom_lat, "lon": zoom_lon},
+                        mapbox=dict(
+                            style="open-street-map",
+                            zoom=6.5,
+                            center=dict(lat=zoom_lat, lon=zoom_lon),
+                        ),
                     )
                 else:
                     # Fallback if selected xdock not in map data
@@ -491,11 +491,11 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
                     fig.update_layout(
                         height=520,
                         margin=dict(l=0, r=0, t=48, b=0),
-                    )
-                    fig.update_mapboxes(
-                        style="open-street-map",
-                        zoom=3.2,
-                        center={"lat": center_lat, "lon": center_lon},
+                        mapbox=dict(
+                            style="open-street-map",
+                            zoom=3.2,
+                            center=dict(lat=center_lat, lon=center_lon),
+                        ),
                     )
             else:
                 # No selection - show full map
@@ -527,11 +527,11 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
                 fig.update_layout(
                     height=520,
                     margin=dict(l=0, r=0, t=48, b=0),
-                )
-                fig.update_mapboxes(
-                    style="open-street-map",
-                    zoom=3.2,
-                    center={"lat": center_lat, "lon": center_lon},
+                    mapbox=dict(
+                        style="open-street-map",
+                        zoom=3.2,
+                        center=dict(lat=center_lat, lon=center_lon),
+                    ),
                 )
             
             st.plotly_chart(fig, use_container_width=True)
