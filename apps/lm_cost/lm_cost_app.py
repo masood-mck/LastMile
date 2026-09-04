@@ -334,24 +334,18 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
     with queue_col:
         st.markdown("### Priority queue")
         if len(overpay_view):
-            overpay_view["Gap Visual"] = (100.0 * overpay_view["CPS Gap vs Expected %"].fillna(0)).clip(lower=0)
-            conf_map = {"Very Low": 0, "Low": 1, "Medium": 2, "High": 3}
-            overpay_view["Confidence Visual"] = overpay_view["Confidence"].map(conf_map).fillna(0)
-            overpay_view["Opportunity Visual"] = overpay_view["Estimated Opportunity"].fillna(0)
-            opp_max = float(overpay_view["Opportunity Visual"].max()) if len(overpay_view) else 0.0
-            if opp_max > 0:
-                overpay_view["Opportunity Visual"] = (100.0 * overpay_view["Opportunity Visual"] / opp_max).clip(0, 100)
+            opp_max = float(overpay_view["Estimated Opportunity"].fillna(0).max()) if len(overpay_view) else 0.0
+            gap_max = float(overpay_view["CPS Gap vs Expected %"].fillna(0).max()) if len(overpay_view) else 0.0
+            opp_max = max(opp_max, 1.0)
+            gap_max = max(gap_max, 0.01)
 
             queue_cols = existing_cols(
                 overpay_view,
                 [
                     "Market / Xdock",
-                    "Confidence",
-                    "Confidence Visual",
                     "Estimated Opportunity",
-                    "Opportunity Visual",
                     "CPS Gap vs Expected %",
-                    "Gap Visual",
+                    "Confidence",
                     "Actual CPS",
                     "Expected CPS",
                     "Expected CPS CS Model",
@@ -365,14 +359,11 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "Estimated Opportunity": st.column_config.NumberColumn(format="$%.0f"),
-                    "Opportunity Visual": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
+                    "Estimated Opportunity": st.column_config.ProgressColumn(min_value=0.0, max_value=opp_max, format="$%.0f"),
                     "Actual CPS": st.column_config.NumberColumn(format="$%.2f"),
                     "Expected CPS": st.column_config.NumberColumn(format="$%.2f"),
                     "Expected CPS CS Model": st.column_config.NumberColumn(format="$%.2f"),
-                    "CPS Gap vs Expected %": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Gap Visual": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
-                    "Confidence Visual": st.column_config.ProgressColumn(min_value=0, max_value=3, format="%.0f"),
+                    "CPS Gap vs Expected %": st.column_config.ProgressColumn(min_value=0.0, max_value=gap_max, format="%.1f%%"),
                 },
             )
         else:
@@ -2717,6 +2708,11 @@ with top_reco_tab:
 
     overpay_queue = business_view[business_view["Signal / Classification"].eq("Overpay candidate")].copy()
     if len(overpay_queue):
+        overpay_queue["Estimated Opportunity"] = np.where(
+            overpay_queue["CPS Gap vs Expected"].fillna(0).gt(0),
+            overpay_queue["CPS Gap vs Expected"].fillna(0) * overpay_queue["Records With CPS"].fillna(0),
+            0.0,
+        )
         overpay_queue["Top Root Cause"] = overpay_queue.apply(lambda r: top_root_cause_label(r, rca_baselines), axis=1)
         overpay_queue["Recommendation 1"] = overpay_queue.apply(lambda r: top_recommendation(r, rca_baselines), axis=1)
         overpay_queue["Action 1 Impact"] = overpay_queue.apply(lambda r: top_action_impact(r, rca_baselines), axis=1)
@@ -2724,19 +2720,19 @@ with top_reco_tab:
         overpay_queue["Recommendation 2"] = overpay_queue.apply(lambda r: second_recommendation(r, rca_baselines), axis=1)
         overpay_queue["Action 2 Impact"] = overpay_queue.apply(lambda r: second_action_impact(r, rca_baselines), axis=1)
         overpay_queue["Action 2 Confidence"] = overpay_queue.apply(lambda r: second_action_confidence(r, rca_baselines), axis=1)
-        overpay_queue["Gap Visual"] = (100.0 * overpay_queue["CPS Gap vs Expected %"].fillna(0)).clip(lower=0)
-        conf_map = {"Very Low": 0, "Low": 1, "Medium": 2, "High": 3}
-        overpay_queue["Confidence Visual"] = overpay_queue["Confidence"].map(conf_map).fillna(0)
+        opp_max_reco = float(overpay_queue["Estimated Opportunity"].fillna(0).max())
+        gap_max_reco = float(overpay_queue["CPS Gap vs Expected %"].fillna(0).max())
+        opp_max_reco = max(opp_max_reco, 1.0)
+        gap_max_reco = max(gap_max_reco, 0.01)
 
         st.markdown("### Overpay queue (Expected CPS gap driven)")
         queue_cols = existing_cols(
             overpay_queue,
             [
                 "Market / Xdock",
-                "Confidence",
-                "Confidence Visual",
+                "Estimated Opportunity",
                 "CPS Gap vs Expected %",
-                "Gap Visual",
+                "Confidence",
                 "Actual CPS",
                 "Expected CPS",
                 "Normalized Cost",
@@ -2788,13 +2784,12 @@ with top_reco_tab:
                 selection_mode="single-row",
                 key="overpay_queue_table",
                 column_config={
+                    "Estimated Opportunity": st.column_config.ProgressColumn(min_value=0.0, max_value=opp_max_reco, format="$%.0f"),
                     "Actual CPS": st.column_config.NumberColumn(format="$%.2f"),
                     "Expected CPS": st.column_config.NumberColumn(format="$%.2f"),
                     "Normalized Cost": st.column_config.NumberColumn(format="$%.2f"),
                     "Cleansheet Aggressive": st.column_config.NumberColumn(format="$%.2f"),
-                    "CPS Gap vs Expected %": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Gap Visual": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
-                    "Confidence Visual": st.column_config.ProgressColumn(min_value=0, max_value=3, format="%.0f"),
+                    "CPS Gap vs Expected %": st.column_config.ProgressColumn(min_value=0.0, max_value=gap_max_reco, format="%.1f%%"),
                 },
             )
             selected_rows = selected_rows_from_event(overpay_event)
