@@ -283,54 +283,20 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
     if len(overpay_view):
         overpay_view["Top Root Cause"] = overpay_view.apply(lambda r: top_root_cause_label(r, baselines), axis=1)
         overpay_view["Recommendation 1"] = overpay_view.apply(lambda r: top_recommendation(r, baselines), axis=1)
+        overpay_view["Action 1 Impact"] = overpay_view.apply(lambda r: top_action_impact(r, baselines), axis=1)
+        overpay_view["Action 1 Confidence"] = overpay_view.apply(lambda r: top_action_confidence(r, baselines), axis=1)
+        overpay_view["Recommendation 2"] = overpay_view.apply(lambda r: second_recommendation(r, baselines), axis=1)
+        overpay_view["Action 2 Impact"] = overpay_view.apply(lambda r: second_action_impact(r, baselines), axis=1)
+        overpay_view["Action 2 Confidence"] = overpay_view.apply(lambda r: second_action_confidence(r, baselines), axis=1)
 
+    # Initialize selection variable at module scope
+    selected_from_exec_queue = None
+    
     map_col, queue_col = st.columns([1.45, 1.0])
-    with map_col:
-        st.markdown("### Opportunity map")
-        map_df = overpay_view.dropna(subset=["latitude", "longitude"]).copy()
-        if len(map_df):
-            color_max = float(map_df["Estimated Opportunity"].quantile(0.95)) if map_df["Estimated Opportunity"].notna().any() else 0.0
-            color_max = max(color_max, float(map_df["Estimated Opportunity"].max()), 1.0)
-            center_lat = float(map_df["latitude"].median())
-            center_lon = float(map_df["longitude"].median())
-            map_hover_data = {
-                "Confidence": True,
-                "Actual CPS": ":$.2f",
-                "Expected CPS": ":$.2f",
-                "Estimated Opportunity": ":$,.0f",
-                "latitude": False,
-                "longitude": False,
-            }
-            if "Market Name" in map_df.columns:
-                map_hover_data["Market Name"] = True
-            if "Expected CPS CS Model" in map_df.columns:
-                map_hover_data["Expected CPS CS Model"] = ":$.2f"
-            fig = px.scatter_map(
-                map_df,
-                lat="latitude",
-                lon="longitude",
-                color="Estimated Opportunity",
-                size="Estimated Opportunity",
-                size_max=26,
-                range_color=[0, color_max],
-                color_continuous_scale=["#BFD7EA", "#4F81BD", "#C8102E"],
-                hover_name="Market / Xdock",
-                hover_data=map_hover_data,
-                title="Overpay opportunity by xdock",
-                zoom=3.2,
-                center={"lat": center_lat, "lon": center_lon},
-            )
-            fig.update_traces(marker=dict(opacity=0.82, sizemode="area"))
-            fig.update_layout(
-                height=520,
-                margin=dict(l=0, r=0, t=48, b=0),
-                map=dict(style="open-street-map"),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Map is ready, but the app data does not yet include xdock latitude/longitude columns.")
-            st.caption("Your notebook geocodes query can be used once ORIGIN_LATITUDE and ORIGIN_LONGITUDE are merged into the exported app dataset.")
-
+    
+    # Placeholder for map - will be updated after table selection
+    map_placeholder = map_col.empty()
+    
     with queue_col:
         st.markdown("### Priority queue")
         if len(overpay_view):
@@ -351,23 +317,221 @@ def render_executive_view(geo_view: pd.DataFrame, baselines: dict[str, float]) -
                     "Expected CPS CS Model",
                     "Top Root Cause",
                     "Recommendation 1",
+                    "Action 1 Impact",
+                    "Action 1 Confidence",
+                    "Recommendation 2",
+                    "Action 2 Impact",
+                    "Action 2 Confidence",
                 ],
             )
-            queue_df = overpay_view.sort_values(["Estimated Opportunity", "CPS Gap vs Expected %"], ascending=[False, False])[queue_cols].head(15)
-            st.dataframe(
-                queue_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Estimated Opportunity": st.column_config.ProgressColumn(min_value=0.0, max_value=opp_max, format="$%.0f"),
-                    "Actual CPS": st.column_config.NumberColumn(format="$%.2f"),
-                    "Expected CPS": st.column_config.NumberColumn(format="$%.2f"),
-                    "Expected CPS CS Model": st.column_config.NumberColumn(format="$%.2f"),
-                    "CPS Gap vs Expected %": st.column_config.ProgressColumn(min_value=0.0, max_value=gap_max, format="%.1f%%"),
-                },
-            )
+            queue_df = overpay_view.sort_values(["Estimated Opportunity", "CPS Gap vs Expected %"], ascending=[False, False])[queue_cols]
+            st.caption(f"Showing {len(queue_df)} overpay markets. Click a row to open details and actions.")
+            
+            try:
+                exec_event = st.dataframe(
+                    queue_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="exec_queue_table",
+                    column_config={
+                        "Estimated Opportunity": st.column_config.ProgressColumn(min_value=0.0, max_value=opp_max, format="$%.0f"),
+                        "Actual CPS": st.column_config.NumberColumn(format="$%.2f"),
+                        "Expected CPS": st.column_config.NumberColumn(format="$%.2f"),
+                        "Expected CPS CS Model": st.column_config.NumberColumn(format="$%.2f"),
+                        "CPS Gap vs Expected %": st.column_config.ProgressColumn(min_value=0.0, max_value=gap_max, format="%.1f%%"),
+                    },
+                )
+                selected_rows = selected_rows_from_event(exec_event)
+                if selected_rows:
+                    row_idx = selected_rows[0]
+                    if 0 <= row_idx < len(queue_df):
+                        selected_from_exec_queue = str(queue_df.iloc[row_idx]["Market / Xdock"])
+                        st.session_state["exec_selected_market"] = selected_from_exec_queue
+            except TypeError:
+                st.dataframe(
+                    queue_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Estimated Opportunity": st.column_config.ProgressColumn(min_value=0.0, max_value=opp_max, format="$%.0f"),
+                        "Actual CPS": st.column_config.NumberColumn(format="$%.2f"),
+                        "Expected CPS": st.column_config.NumberColumn(format="$%.2f"),
+                        "Expected CPS CS Model": st.column_config.NumberColumn(format="$%.2f"),
+                        "CPS Gap vs Expected %": st.column_config.ProgressColumn(min_value=0.0, max_value=gap_max, format="%.1f%%"),
+                    },
+                )
+
+            if selected_from_exec_queue is None:
+                persisted_exec_market = st.session_state.get("exec_selected_market")
+                if (
+                    persisted_exec_market is not None
+                    and "Market / Xdock" in queue_df.columns
+                    and persisted_exec_market in set(queue_df["Market / Xdock"].astype(str))
+                ):
+                    selected_from_exec_queue = persisted_exec_market
+
+            # Auto-open popup when a new row is selected in the table
+            if selected_from_exec_queue:
+                last_opened_exec_market = st.session_state.get("exec_last_opened_market")
+                if selected_from_exec_queue != last_opened_exec_market:
+                    popup_row_df = overpay_view[
+                        overpay_view["Market / Xdock"].astype(str).eq(selected_from_exec_queue)
+                    ]
+                    if not popup_row_df.empty:
+                        st.session_state["exec_last_opened_market"] = selected_from_exec_queue
+                        open_recommendation_popup(
+                            "Executive priority queue drilldown",
+                            popup_row_df.iloc[0],
+                            baselines,
+                        )
         else:
             st.info("No overpay candidates with the current filters.")
+
+    # Render map dynamically based on table selection
+    with map_placeholder.container():
+        st.markdown("### Opportunity map")
+        map_df = overpay_view.dropna(subset=["latitude", "longitude"]).copy()
+        if len(map_df):
+            # Determine if a row is selected and filter map accordingly
+            selected_xdock_for_map = None
+            if selected_from_exec_queue:
+                selected_xdock_for_map = selected_from_exec_queue
+            
+            # Prepare map data with highlighting
+            map_data_all = map_df.copy()
+            if selected_xdock_for_map:
+                # Filter to show all but highlight the selected one
+                selected_row = map_df[map_df["Market / Xdock"].astype(str).eq(selected_xdock_for_map)]
+                if not selected_row.empty:
+                    map_data_all["Is Selected"] = map_data_all["Market / Xdock"].astype(str).eq(selected_xdock_for_map)
+                    
+                    # Use color and size to distinguish selected
+                    color_max = float(map_data_all["Estimated Opportunity"].fillna(0).max()) if map_data_all["Estimated Opportunity"].notna().any() else 1.0
+                    
+                    # Create figure with all points
+                    fig = px.scatter_map(
+                        map_data_all,
+                        lat="latitude",
+                        lon="longitude",
+                        color="Estimated Opportunity",
+                        size="Estimated Opportunity",
+                        size_max=26,
+                        range_color=[0, color_max],
+                        color_continuous_scale=["#BFD7EA", "#4F81BD", "#C8102E"],
+                        hover_name="Market / Xdock",
+                        hover_data={
+                            "Confidence": True,
+                            "Actual CPS": ":$.2f",
+                            "Expected CPS": ":$.2f",
+                            "Estimated Opportunity": ":$,.0f",
+                            "latitude": False,
+                            "longitude": False,
+                            "Is Selected": False,
+                        } | ({"Market Name": True} if "Market Name" in map_data_all.columns else {}) | ({"Expected CPS CS Model": ":$.2f"} if "Expected CPS CS Model" in map_data_all.columns else {}),
+                        title="Overpay opportunity by xdock (Click table row to zoom)",
+                    )
+                    
+                    # Zoom to selected xdock
+                    zoom_lat = float(selected_row.iloc[0]["latitude"])
+                    zoom_lon = float(selected_row.iloc[0]["longitude"])
+                    
+                    # Add emphasis to selected marker
+                    fig.update_traces(
+                        marker=dict(opacity=0.82, sizemode="area", line=dict(width=0)),
+                    )
+                    
+                    # Highlight selected point with a ring
+                    fig.add_scattermapbox(
+                        lat=[zoom_lat],
+                        lon=[zoom_lon],
+                        mode="markers",
+                        marker=dict(size=20, color="rgba(200, 16, 46, 0)", line=dict(width=3, color=MCK_RED)),
+                        hoverinfo="skip",
+                        showlegend=False,
+                    )
+                    
+                    fig.update_layout(
+                        height=520,
+                        margin=dict(l=0, r=0, t=48, b=0),
+                        map=dict(style="open-street-map"),
+                        zoom=6.5,
+                        center={"lat": zoom_lat, "lon": zoom_lon},
+                    )
+                else:
+                    # Fallback if selected xdock not in map data
+                    color_max = float(map_data_all["Estimated Opportunity"].fillna(0).max()) if map_data_all["Estimated Opportunity"].notna().any() else 1.0
+                    center_lat = float(map_data_all["latitude"].median())
+                    center_lon = float(map_data_all["longitude"].median())
+                    
+                    fig = px.scatter_map(
+                        map_data_all,
+                        lat="latitude",
+                        lon="longitude",
+                        color="Estimated Opportunity",
+                        size="Estimated Opportunity",
+                        size_max=26,
+                        range_color=[0, color_max],
+                        color_continuous_scale=["#BFD7EA", "#4F81BD", "#C8102E"],
+                        hover_name="Market / Xdock",
+                        hover_data={
+                            "Confidence": True,
+                            "Actual CPS": ":$.2f",
+                            "Expected CPS": ":$.2f",
+                            "Estimated Opportunity": ":$,.0f",
+                            "latitude": False,
+                            "longitude": False,
+                        } | ({"Market Name": True} if "Market Name" in map_data_all.columns else {}) | ({"Expected CPS CS Model": ":$.2f"} if "Expected CPS CS Model" in map_data_all.columns else {}),
+                        title="Overpay opportunity by xdock",
+                    )
+                    fig.update_traces(marker=dict(opacity=0.82, sizemode="area"))
+                    fig.update_layout(
+                        height=520,
+                        margin=dict(l=0, r=0, t=48, b=0),
+                        map=dict(style="open-street-map"),
+                        zoom=3.2,
+                        center={"lat": center_lat, "lon": center_lon},
+                    )
+            else:
+                # No selection - show full map
+                color_max = float(map_data_all["Estimated Opportunity"].fillna(0).max()) if map_data_all["Estimated Opportunity"].notna().any() else 1.0
+                center_lat = float(map_data_all["latitude"].median())
+                center_lon = float(map_data_all["longitude"].median())
+                
+                fig = px.scatter_map(
+                    map_data_all,
+                    lat="latitude",
+                    lon="longitude",
+                    color="Estimated Opportunity",
+                    size="Estimated Opportunity",
+                    size_max=26,
+                    range_color=[0, color_max],
+                    color_continuous_scale=["#BFD7EA", "#4F81BD", "#C8102E"],
+                    hover_name="Market / Xdock",
+                    hover_data={
+                        "Confidence": True,
+                        "Actual CPS": ":$.2f",
+                        "Expected CPS": ":$.2f",
+                        "Estimated Opportunity": ":$,.0f",
+                        "latitude": False,
+                        "longitude": False,
+                    } | ({"Market Name": True} if "Market Name" in map_data_all.columns else {}) | ({"Expected CPS CS Model": ":$.2f"} if "Expected CPS CS Model" in map_data_all.columns else {}),
+                    title="Overpay opportunity by xdock",
+                )
+                fig.update_traces(marker=dict(opacity=0.82, sizemode="area"))
+                fig.update_layout(
+                    height=520,
+                    margin=dict(l=0, r=0, t=48, b=0),
+                    map=dict(style="open-street-map"),
+                    zoom=3.2,
+                    center={"lat": center_lat, "lon": center_lon},
+                )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Map is ready, but the app data does not yet include xdock latitude/longitude columns.")
+            st.caption("Your notebook geocodes query can be used once ORIGIN_LATITUDE and ORIGIN_LONGITUDE are merged into the exported app dataset.")
 
     st.markdown("### Why these markets")
     left_col, right_col = st.columns([1.0, 1.0])
